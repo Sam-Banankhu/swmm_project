@@ -4,22 +4,17 @@ dataset_generator.py
 Generates the ML training dataset for the Hybrid AI sensor placement project.
 Sambito & Mhango (2026)
 
-What this script does:
-  1. Loads the SWMM Example 8 network
-  2. Builds static topology features for every node using NetworkX
-  3. Runs N contamination scenarios through SWMM, varying:
-       - source node (non-uniform probability, J4/J10/JI18 at 2x)
-       - contaminant mass  (random, 0.01 to 0.5 kg equivalent)
-       - injection duration (random, 0.25 to 3.0 hours)
-       - injection start time (random, within first 6 hours)
-  4. For each (scenario, node) pair records:
-       - peak concentration
-       - time to peak
-       - binary detection flag (threshold = 5 mg/L)
-  5. Computes per-node summary features across all scenarios
-  6. Saves two files:
-       - raw_scenarios.csv     (one row per scenario x node)
-       - node_features.csv     (one row per node, aggregated features)
+raw_scenarios.csv columns (matches concept note exactly):
+  scen_id        scenario number
+  src_node       injection node
+  node_id        observed node
+  dist_src       pipe-segment distance from src_node to node_id
+  topo_depth     shortest directed path from node_id to nearest outfall
+  peak_conc      peak concentration at node_id (mg/L)
+  t_peak_min     time from injection start to peak (minutes); blank if none
+  mean_flow_m3s  mean total inflow at node_id during scenario (m3/s)
+  detected       1 if peak_conc >= 5 mg/L, else 0
+  mass_kg / duration_hrs / start_hrs / conc_injected  (scenario parameters)
 
 Usage:
   python dataset_generator.py --n_scenarios 100 --output_dir ./output
@@ -29,516 +24,363 @@ Requirements:
   pip install pyswmm swmm-toolkit networkx pandas numpy
 """
 
-import os
-import sys
-import argparse
-import shutil
-import random
-import warnings
+import os, argparse, random, warnings
 import numpy as np
 import pandas as pd
 import networkx as nx
-from swmm.toolkit.solver import (
-    swmm_open, swmm_close, swmm_start, swmm_step, swmm_end
-)
+from swmm.toolkit.solver import swmm_open, swmm_close, swmm_start, swmm_step, swmm_end
 from swmm.toolkit import solver as slv
 
 warnings.filterwarnings('ignore')
 
-# ── Configuration ─────────────────────────────────────────────────────────────
-
-INP_FILE       = 'Example8.inp'       # path to your SWMM input file
-THRESHOLD      = 5.0                  # mg/L detection threshold
-CARRIER_FLOW   = 0.01                 # cfs - small carrier flow to transport pollutant
-
-# Contamination parameter ranges (from Sambito et al. 2020)
-MASS_MIN       = 0.01                 # kg
-MASS_MAX       = 0.50                 # kg
-DURATION_MIN   = 0.25                 # hours
-DURATION_MAX   = 3.0                  # hours
-START_MIN      = 0.0                  # hours from sim start
-START_MAX      = 6.0                  # hours from sim start
-
-# Non-uniform source node probabilities (v1.0 Figure 2)
-# J4, J10, JI18 have double contamination probability
+# ── Configuration ──────────────────────────────────────────────────────────────
+THRESHOLD       = 5.0        # mg/L
+CARRIER_FLOW    = 0.01       # cfs
+CFS_TO_M3S      = 0.028317
+MASS_MIN, MASS_MAX          = 0.01, 0.50    # kg
+DURATION_MIN, DURATION_MAX  = 0.25, 3.0    # hours
+START_MIN, START_MAX        = 0.0,  6.0    # hours
 HIGH_RISK_NODES = {'J4', 'J10', 'JI18'}
-
-# Nodes to EXCLUDE as injection sources (outfalls, storage, non-physical)
 EXCLUDE_SOURCE  = {'O1', 'O2', 'Well'}
 
-# ── Step 1: Read node list from SWMM file ─────────────────────────────────────
 
-def get_nodes_and_links(inp_file):
-    """
-    Parse the SWMM input file to get:
-      - list of all node IDs
-      - list of (from_node, to_node) for all conduits
-      - node type mapping (J=sewer, JI=interceptor, Aux=special, outfall, storage)
-    """
-    nodes    = []
-    links    = []
-    outfalls = []
-    storage  = []
-
+# ── 1. Parse network ───────────────────────────────────────────────────────────
+def parse_network(inp_file):
+    nodes, outfalls, storage, links = [], [], [], []
     section = None
     with open(inp_file) as f:
         for line in f:
-            line = line.strip()
-            if not line or line.startswith(';;'):
-                continue
-            if line.startswith('['):
-                section = line.strip('[]').upper()
-                continue
+            s = line.strip()
+            if not s or s.startswith(';;'): continue
+            if s.startswith('['):
+                section = s.strip('[]').upper(); continue
+            parts = s.split()
+            if not parts: continue
+            if section == 'JUNCTIONS':  nodes.append(parts[0])
+            elif section == 'OUTFALLS': outfalls.append(parts[0]); nodes.append(parts[0])
+            elif section == 'STORAGE':  storage.append(parts[0]);  nodes.append(parts[0])
+            elif section in ('CONDUITS','PUMPS','WEIRS','ORIFICES'):
+                if len(parts) >= 3: links.append((parts[1], parts[2]))
 
-            parts = line.split()
-            if not parts:
-                continue
-
-            if section == 'JUNCTIONS':
-                nodes.append(parts[0])
-            elif section == 'OUTFALLS':
-                outfalls.append(parts[0])
-                nodes.append(parts[0])
-            elif section == 'STORAGE':
-                storage.append(parts[0])
-                nodes.append(parts[0])
-            elif section == 'CONDUITS':
-                if len(parts) >= 3:
-                    links.append((parts[1], parts[2], parts[0]))  # from, to, name
-
-    def node_type(n):
-        if n in outfalls:   return 'outfall'
-        if n in storage:    return 'storage'
-        if n == 'Aux3':     return 'aux'
+    def ntype(n):
+        if n in outfalls:      return 'outfall'
+        if n in storage:       return 'storage'
+        if n == 'Aux3':        return 'aux'
         if n.startswith('JI'): return 'JI'
         if n.startswith('J'):  return 'J'
         return 'other'
 
-    node_types = {n: node_type(n) for n in nodes}
-    return nodes, links, node_types
+    node_types = {n: ntype(n) for n in nodes}
+
+    G_dir = nx.DiGraph(); G_dir.add_nodes_from(nodes)
+    G_und = nx.Graph();   G_und.add_nodes_from(nodes)
+    for f, t in links:
+        if f in G_dir and t in G_dir:
+            G_dir.add_edge(f, t)
+            G_und.add_edge(f, t)
+
+    return nodes, outfalls, node_types, G_dir, G_und
 
 
-# ── Step 2: Build topology features using NetworkX ───────────────────────────
-
-def build_topology_features(nodes, links, node_types):
-    """
-    Builds a directed graph of the sewer network and computes
-    static topology features for each node.
-
-    Features computed:
-      - topo_depth          : shortest path distance to nearest outfall
-      - n_upstream_nodes    : number of nodes that can reach this node
-      - betweenness         : betweenness centrality (normalised)
-      - downstream_paths    : number of distinct downstream routes to any outfall
-      - node_type_code      : 0=J, 1=JI, 2=Aux, 3=outfall, 4=storage, 5=other
-      - is_high_risk        : 1 if node is J4, J10, or JI18 (v1.0 Figure 2)
-      - prior_contam_prob   : contamination source probability (v1.0 Figure 2)
-    """
-    G = nx.DiGraph()
-    G.add_nodes_from(nodes)
-    for from_n, to_n, _ in links:
-        if from_n in G and to_n in G:
-            G.add_edge(from_n, to_n)
-
-    outfalls = [n for n, t in node_types.items() if t == 'outfall']
-
-    # Shortest path to nearest outfall
-    def topo_depth(node):
+# ── 2. Topology distances ──────────────────────────────────────────────────────
+def compute_topo_depth(nodes, outfalls, G_dir):
+    depth = {}
+    for n in nodes:
         best = 999
         for o in outfalls:
-            try:
-                d = nx.shortest_path_length(G, node, o)
-                best = min(best, d)
-            except nx.NetworkXNoPath:
-                pass
-        return best
+            try: best = min(best, nx.shortest_path_length(G_dir, n, o))
+            except: pass
+        depth[n] = best
+    return depth
 
-    # Upstream node count (nodes that can reach this one)
-    def upstream_count(node):
-        try:
-            return len(nx.ancestors(G, node))
-        except:
-            return 0
+def compute_dist_matrix(nodes, G_und):
+    return dict(nx.all_pairs_shortest_path_length(G_und))
 
-    # Number of downstream paths to any outfall
-    def downstream_path_count(node):
-        count = 0
+
+# ── 3. Static feature table ────────────────────────────────────────────────────
+def build_topology_features(nodes, outfalls, node_types, G_dir, topo_depth):
+    bc       = nx.betweenness_centrality(G_dir, normalized=True)
+    type_map = {'J':0, 'JI':1, 'aux':2, 'outfall':3, 'storage':4, 'other':5}
+    n_high   = len(HIGH_RISK_NODES)
+    base_p   = 1.0 / (len(nodes) + n_high)
+    high_p   = 2.0 * base_p
+
+    def down_paths(n):
+        c = 0
         for o in outfalls:
-            try:
-                paths = list(nx.all_simple_paths(G, node, o, cutoff=20))
-                count += len(paths)
-            except:
-                pass
-        return count
-
-    # Betweenness centrality
-    bc = nx.betweenness_centrality(G, normalized=True)
-
-    # Node type code
-    type_map = {'J': 0, 'JI': 1, 'aux': 2, 'outfall': 3, 'storage': 4, 'other': 5}
-
-    # Prior contamination probability (from v1.0 Figure 2)
-    # High-risk nodes ~0.06, others ~0.03
-    n_nodes    = len(nodes)
-    n_high     = len(HIGH_RISK_NODES)
-    # Normalised so all probs sum to 1
-    base_prob  = 1.0 / (n_nodes + n_high)   # high-risk nodes count double
-    high_prob  = 2.0 * base_prob
+            try: c += len(list(nx.all_simple_paths(G_dir, n, o, cutoff=20)))
+            except: pass
+        return c
 
     rows = []
     for n in nodes:
         rows.append({
-            'node_id':            n,
-            'topo_depth':         topo_depth(n),
-            'n_upstream_nodes':   upstream_count(n),
-            'betweenness':        round(bc.get(n, 0), 6),
-            'downstream_paths':   downstream_path_count(n),
-            'node_type':          node_types[n],
-            'node_type_code':     type_map.get(node_types[n], 5),
-            'is_high_risk':       1 if n in HIGH_RISK_NODES else 0,
-            'prior_contam_prob':  high_prob if n in HIGH_RISK_NODES else base_prob,
+            'node_id':          n,
+            'topo_depth':       topo_depth[n],
+            'n_upstream_nodes': len(nx.ancestors(G_dir, n)),
+            'betweenness':      round(bc.get(n, 0), 6),
+            'downstream_paths': down_paths(n),
+            'node_type':        node_types[n],
+            'node_type_code':   type_map.get(node_types[n], 5),
+            'is_high_risk':     1 if n in HIGH_RISK_NODES else 0,
+            'prior_contam_prob': high_p if n in HIGH_RISK_NODES else base_p,
         })
-
     return pd.DataFrame(rows).set_index('node_id')
 
 
-# ── Step 3: Build a modified SWMM inp for one scenario ───────────────────────
-
+# ── 4. Scenario .inp builder ───────────────────────────────────────────────────
 def format_time(hours):
-    """Convert decimal hours to HH:MM, clamped to 11:59"""
     hours = min(max(hours, 0.0), 11.99)
-    h = int(hours)
-    m = int(round((hours - h) * 60))
-    if m == 60:
-        h += 1
-        m = 0
+    h = int(hours); m = int(round((hours - h) * 60))
+    if m == 60: h += 1; m = 0
     return f"{h:02d}:{m:02d}"
 
-def build_scenario_inp(base_inp, tmp_inp, source_node,
-                       concentration_mg_l, duration_hrs, start_hrs):
-    """
-    Writes a temporary SWMM input file with one contamination event injected
-    at source_node starting at start_hrs, lasting duration_hrs hours,
-    at the given concentration (mg/L).
+def build_scenario_inp(base_inp, tmp_inp, src, conc_mg_l, dur_hrs, start_hrs):
+    end_hrs  = start_hrs + dur_hrs
+    pre_hrs  = max(0.0, start_hrs - 1.0/60.0)
+    post_hrs = end_hrs + 5.0/60.0
 
-    A small carrier flow (CARRIER_FLOW cfs) is also injected alongside the
-    concentration so that SWMM's CONCEN inflow type has flow to carry it.
-    """
-    end_hrs     = start_hrs + duration_hrs
-    pre_hrs     = max(0.0, start_hrs - (1.0/60.0))   # 1 min before start
-    post_hrs    = end_hrs + (5.0/60.0)                # 5 min after end
-
-    def ts_points(value_on):
+    def ts(val):
         return [
-            ("00:00",              0.0),
-            (format_time(pre_hrs), 0.0),
-            (format_time(start_hrs), value_on),
-            (format_time(end_hrs),   value_on),
+            ("00:00",                0.0),
+            (format_time(pre_hrs),   0.0),
+            (format_time(start_hrs), val),
+            (format_time(end_hrs),   val),
             (format_time(post_hrs),  0.0),
-            ("12:00",              0.0),
+            ("12:00",                0.0),
         ]
 
+    ts_flow = f'CarrierFlow_{src}'
+    ts_conc = f'ContamConc_{src}'
+
     with open(base_inp) as f:
-        lines = f.readlines()
+        content = f.read()
 
-    new_lines      = []
-    ts_done        = False
-    inflow_done    = False
-    ts_name_flow   = f'CarrierFlow_{source_node}'
-    ts_name_conc   = f'ContamConc_{source_node}'
+    # Remove invalid QUALITY keyword that causes ERROR 205
+    content = content.replace('QUALITY    ALL\n', '').replace('QUALITY ALL\n', '')
 
-    for line in lines:
-        new_lines.append(line)
+    # Ensure POLLUTANTS section is present
+    if '[POLLUTANTS]' not in content:
+        pb = ('[POLLUTANTS]\n'
+              ';;Name  Units  Crain  Cgw    Crdii  Kdecay  SnowOnly\n'
+              'CONTAM  MG/L   0.0    0.0    0.0    0.0     NO\n\n')
+        content = content.replace('[INFLOWS]', pb + '[INFLOWS]')
 
-        # Append timeseries after the last Rain timeseries line
+    out = []; ts_done = inflow_done = False
+    for line in content.splitlines(keepends=True):
+        out.append(line)
+        # Append timeseries after last Rain line
         if 'Rain_023in' in line and '12:00' in line and not ts_done:
-            for t, v in ts_points(CARRIER_FLOW):
-                new_lines.append(f'{ts_name_flow:<28}{t:<12}{v}\n')
-            for t, v in ts_points(concentration_mg_l):
-                new_lines.append(f'{ts_name_conc:<28}{t:<12}{v}\n')
+            for t, v in ts(CARRIER_FLOW):
+                out.append(f'{ts_flow:<28}{t:<12}{v}\n')
+            for t, v in ts(conc_mg_l):
+                out.append(f'{ts_conc:<28}{t:<12}{v}\n')
             ts_done = True
-
-        # Add inflow lines after the last dry weather inflow line
+        # Append inflow entries after last DWF inflow
         if 'J12              FLOW' in line and '0.0125' in line and not inflow_done:
-            new_lines.append(
-                f'{source_node:<17}FLOW             {ts_name_flow:<17}DIRECT   1.0      1.0\n'
-            )
-            new_lines.append(
-                f'{source_node:<17}CONTAM           {ts_name_conc:<17}CONCEN   1.0      1.0\n'
-            )
+            out.append(f'{src:<17}FLOW   {ts_flow:<20}DIRECT  1.0  1.0\n')
+            out.append(f'{src:<17}CONTAM {ts_conc:<20}CONCEN  1.0  1.0\n')
             inflow_done = True
 
     with open(tmp_inp, 'w') as f:
-        f.writelines(new_lines)
+        f.writelines(out)
 
 
-# ── Step 4: Run one scenario and extract results ──────────────────────────────
-
+# ── 5. Run one scenario ────────────────────────────────────────────────────────
 def run_scenario(tmp_inp, node_ids):
     """
-    Runs SWMM on tmp_inp and returns a dict:
-      node_id -> {peak_conc, time_to_peak_min, detected}
+    Run SWMM using the low-level swmm.toolkit API.
+    Collects per-node: peak_conc, t_peak_min, mean_flow_m3s, detected.
+    node_get_pollutant(i, 0)[0]  -> CONTAM concentration
+    node_get_result(i, 0)        -> total inflow (cfs)
     """
-    rpt   = tmp_inp.replace('.inp', '.rpt')
-    out_f = tmp_inp.replace('.inp', '.out')
-
-    results = {}
+    rpt, outf = tmp_inp.replace('.inp','.rpt'), tmp_inp.replace('.inp','.out')
+    results   = {}
 
     try:
-        swmm_open(tmp_inp, rpt, out_f)
+        swmm_open(tmp_inp, rpt, outf)
         swmm_start(True)
 
-        # We record concentration at every routing step (15 seconds)
-        # time_to_peak is in minutes
-        node_peaks     = {nid: 0.0   for nid in node_ids}
-        node_peak_step = {nid: 0     for nid in node_ids}
-        step_count = 0
+        n_count   = slv.project_get_count(slv.swmm_NODE)
+        ids_order = [slv.project_get_id(slv.swmm_NODE, i) for i in range(n_count)]
+
+        peaks      = {nid: 0.0 for nid in ids_order}
+        peak_step  = {nid: 0   for nid in ids_order}
+        inflow_sum = {nid: 0.0 for nid in ids_order}
+        step_n = 0
 
         while True:
             t = swmm_step()
-            if t == 0:
-                break
-            step_count += 1
-            for i, nid in enumerate(node_ids):
+            if t == 0: break
+            step_n += 1
+            for i, nid in enumerate(ids_order):
+                # concentration
                 c = slv.node_get_pollutant(i, 0)[0]
-                if c > node_peaks[nid]:
-                    node_peaks[nid]     = c
-                    node_peak_step[nid] = step_count
+                if c > peaks[nid]:
+                    peaks[nid]     = c
+                    peak_step[nid] = step_n
+                # inflow (cfs)
+                inflow_sum[nid] += abs(slv.node_get_result(i, 0))
 
         swmm_end()
         swmm_close()
 
-        # Convert step number to minutes (15s per step)
         for nid in node_ids:
-            peak = node_peaks[nid]
-            t_peak = (node_peak_step[nid] * 15.0) / 60.0 if peak > 0 else None
+            peak  = peaks.get(nid, 0.0)
+            pstep = peak_step.get(nid, 0)
+            mflow = round((inflow_sum.get(nid, 0.0) / max(step_n, 1)) * CFS_TO_M3S, 6)
             results[nid] = {
-                'peak_conc':       round(peak, 4),
-                'time_to_peak_min': round(t_peak, 2) if t_peak else None,
-                'detected':         1 if peak >= THRESHOLD else 0,
+                'peak_conc':     round(peak, 4),
+                't_peak_min':    round(pstep * 15.0 / 60.0, 2) if peak > 0 else None,
+                'mean_flow_m3s': mflow,
+                'detected':      1 if peak >= THRESHOLD else 0,
             }
 
     except Exception as e:
-        print(f"    WARNING: simulation failed - {e}")
+        print(f"    WARNING: simulation failed -- {e}")
         for nid in node_ids:
-            results[nid] = {'peak_conc': 0.0, 'time_to_peak_min': None, 'detected': 0}
+            results[nid] = {
+                'peak_conc': 0.0, 't_peak_min': None,
+                'mean_flow_m3s': 0.0, 'detected': 0,
+            }
     finally:
-        for f in [rpt, out_f]:
+        for f in [rpt, outf]:
             try: os.remove(f)
             except: pass
 
     return results
 
 
-# ── Step 5: Build source node sampling weights ────────────────────────────────
+# ── Helpers ────────────────────────────────────────────────────────────────────
+def sampling_weights(candidates):
+    w = [2 if n in HIGH_RISK_NODES else 1 for n in candidates]
+    t = sum(w)
+    return candidates, [x / t for x in w]
 
-def build_sampling_weights(candidate_nodes):
-    """
-    Returns a list of (node, weight) pairs.
-    High-risk nodes (J4, J10, JI18) get weight 2, others get weight 1.
-    """
-    weights = []
-    for n in candidate_nodes:
-        w = 2 if n in HIGH_RISK_NODES else 1
-        weights.append(w)
-    total = sum(weights)
-    probs = [w / total for w in weights]
-    return candidate_nodes, probs
+def mass_to_conc(mass_kg, dur_hrs):
+    vol = CARRIER_FLOW * (dur_hrs * 3600) * 28.317
+    return round((mass_kg * 1e6) / max(vol, 1e-9), 2)
 
 
-# ── Step 6: Convert mass (kg) to concentration (mg/L) for injection ──────────
-
-def mass_to_concentration(mass_kg, duration_hrs, carrier_flow_cfs):
-    """
-    Converts an injection mass (kg) and duration into a concentration (mg/L)
-    given the carrier flow rate.
-
-    mass_kg      = total pollutant mass to inject
-    duration_hrs = injection duration in hours
-    carrier_cfs  = carrier flow in cubic feet per second
-
-    mass_kg -> grams -> milligrams
-    volume  = carrier_flow_cfs * duration_hrs * 3600 seconds * 28.317 L/ft3
-    conc    = mass_mg / volume_L
-    """
-    mass_mg    = mass_kg * 1e6
-    vol_liters = carrier_flow_cfs * (duration_hrs * 3600) * 28.317
-    conc       = mass_mg / vol_liters if vol_liters > 0 else 0
-    return round(conc, 2)
-
-
-# ── Main pipeline ─────────────────────────────────────────────────────────────
-
+# ── Main ───────────────────────────────────────────────────────────────────────
 def main(inp_file, n_scenarios, output_dir, seed=42):
-
-    random.seed(seed)
-    np.random.seed(seed)
+    random.seed(seed); np.random.seed(seed)
     os.makedirs(output_dir, exist_ok=True)
 
     print("=" * 60)
-    print("SWMM Dataset Generator")
-    print("Hybrid AI Sensor Placement -- Mhango & Sambito (2026)")
+    print("SWMM Dataset Generator  --  Mhango & Sambito (2026)")
     print("=" * 60)
 
-    # ── Load network ──
-    print("\n[1/5] Reading network from SWMM input file...")
-    all_nodes, links, node_types = get_nodes_and_links(inp_file)
-    print(f"      Nodes found : {len(all_nodes)}")
-    print(f"      Links found : {len(links)}")
+    # Parse
+    print("\n[1/5] Parsing network...")
+    nodes, outfalls, node_types, G_dir, G_und = parse_network(inp_file)
+    candidates = [n for n in nodes
+                  if n not in EXCLUDE_SOURCE
+                  and node_types[n] not in ('outfall', 'storage')]
+    print(f"      Nodes: {len(nodes)}  |  Candidate sources: {len(candidates)}")
 
-    # Candidate source nodes (exclude outfalls, storage)
-    candidate_sources = [
-        n for n in all_nodes
-        if n not in EXCLUDE_SOURCE and node_types[n] not in ('outfall', 'storage')
-    ]
-    print(f"      Candidate injection nodes: {len(candidate_sources)}")
+    # Distances
+    print("\n[2/5] Computing topology distances...")
+    topo_depth  = compute_topo_depth(nodes, outfalls, G_dir)
+    dist_matrix = compute_dist_matrix(nodes, G_und)
+    topo_df     = build_topology_features(nodes, outfalls, node_types, G_dir, topo_depth)
+    valid_depths = [v for v in topo_depth.values() if v < 999]
+    print(f"      topo_depth range: {min(valid_depths)} to {max(valid_depths)}")
 
-    # ── Build topology features ──
-    print("\n[2/5] Computing topology features...")
-    topo_df = build_topology_features(all_nodes, links, node_types)
-    print(f"      Features computed for {len(topo_df)} nodes")
-    print(f"      Columns: {list(topo_df.columns)}")
+    # Scenarios
+    src_nodes, src_probs = sampling_weights(candidates)
+    tmp_inp = os.path.join(os.path.dirname(inp_file), '_scenario_tmp.inp')
 
-    # ── Set up sampling ──
-    src_nodes, src_probs = build_sampling_weights(candidate_sources)
+    print(f"\n[3/5] Running {n_scenarios} scenarios...")
+    raw_rows = []
 
-    # ── Run scenarios ──
-    print(f"\n[3/5] Running {n_scenarios} contamination scenarios...")
-    print(f"      Source: {inp_file}")
-    print(f"      Detection threshold: {THRESHOLD} mg/L")
-    print(f"      Injection duration: U[{DURATION_MIN}, {DURATION_MAX}] hours")
-    print(f"      Injection mass:     U[{MASS_MIN}, {MASS_MAX}] kg")
-    print()
+    for i in range(n_scenarios):
+        src      = np.random.choice(src_nodes, p=src_probs)
+        mass_kg  = random.uniform(MASS_MIN, MASS_MAX)
+        dur_hrs  = random.uniform(DURATION_MIN, DURATION_MAX)
+        start_hr = random.uniform(START_MIN, START_MAX)
+        conc     = mass_to_conc(mass_kg, dur_hrs)
 
-    raw_rows   = []
-    tmp_inp    = os.path.join(os.path.dirname(inp_file), '_scenario_tmp.inp')
+        if (i + 1) % 10 == 0 or i == 0:
+            print(f"  Scenario {i+1:>5}/{n_scenarios}  "
+                  f"src={src:<8} mass={mass_kg:.3f}kg  "
+                  f"dur={dur_hrs:.2f}h  conc={conc:.1f}mg/L")
 
-    for scen_i in range(n_scenarios):
+        build_scenario_inp(inp_file, tmp_inp, src, conc, dur_hrs, start_hr)
+        res = run_scenario(tmp_inp, nodes)
 
-        # Sample scenario parameters
-        source_node   = np.random.choice(src_nodes, p=src_probs)
-        mass_kg       = random.uniform(MASS_MIN, MASS_MAX)
-        duration_hrs  = random.uniform(DURATION_MIN, DURATION_MAX)
-        start_hrs     = random.uniform(START_MIN, START_MAX)
-        concentration = mass_to_concentration(mass_kg, duration_hrs, CARRIER_FLOW)
-
-        if (scen_i + 1) % 10 == 0 or scen_i == 0:
-            print(f"  Scenario {scen_i+1:>5}/{n_scenarios}  "
-                  f"source={source_node:<8}  "
-                  f"mass={mass_kg:.3f}kg  "
-                  f"dur={duration_hrs:.2f}h  "
-                  f"start={start_hrs:.2f}h  "
-                  f"conc={concentration:.1f}mg/L")
-
-        # Build temp inp file
-        build_scenario_inp(
-            inp_file, tmp_inp, source_node,
-            concentration, duration_hrs, start_hrs
-        )
-
-        # Run simulation
-        node_results = run_scenario(tmp_inp, all_nodes)
-
-        # Store one row per (scenario, node)
-        for node_id in all_nodes:
-            r = node_results[node_id]
+        for nid in nodes:
+            r = res[nid]
             raw_rows.append({
-                'scen_id':          scen_i + 1,
-                'src_node':         source_node,
-                'mass_kg':          round(mass_kg, 4),
-                'duration_hrs':     round(duration_hrs, 3),
-                'start_hrs':        round(start_hrs, 3),
-                'conc_injected':    concentration,
-                'node_id':          node_id,
-                'peak_conc':        r['peak_conc'],
-                'time_to_peak_min': r['time_to_peak_min'],
-                'detected':         r['detected'],
+                'scen_id':       i + 1,
+                'src_node':      src,
+                'mass_kg':       round(mass_kg, 4),
+                'duration_hrs':  round(dur_hrs, 3),
+                'start_hrs':     round(start_hr, 3),
+                'conc_injected': conc,
+                'node_id':       nid,
+                'dist_src':      dist_matrix.get(src, {}).get(nid, 999),
+                'topo_depth':    topo_depth[nid],
+                'peak_conc':     r['peak_conc'],
+                't_peak_min':    r['t_peak_min'],
+                'mean_flow_m3s': r['mean_flow_m3s'],
+                'detected':      r['detected'],
             })
 
-    # Clean up temp file
     try: os.remove(tmp_inp)
     except: pass
+    print(f"\n  Done. Total rows: {len(raw_rows):,}")
 
-    print(f"\n  Done. Total rows: {len(raw_rows)}")
-
-    # ── Save raw scenarios ──
-    print("\n[4/5] Saving raw scenario dataset...")
-    raw_df = pd.DataFrame(raw_rows)
+    # Save raw
+    print("\n[4/5] Saving raw_scenarios.csv...")
+    raw_df   = pd.DataFrame(raw_rows)
     raw_path = os.path.join(output_dir, 'raw_scenarios.csv')
     raw_df.to_csv(raw_path, index=False)
-    print(f"      Saved: {raw_path}  ({len(raw_df)} rows)")
+    print(f"      {raw_path}  ({len(raw_df):,} rows)")
 
-    # ── Aggregate node features ──
-    print("\n[5/5] Aggregating node-level features...")
-
-    # Per-node dynamic features aggregated across all scenarios
+    # Build node_features
+    print("\n[5/5] Building node_features.csv...")
     grp = raw_df.groupby('node_id')
-
     node_agg = pd.DataFrame({
-        'detection_freq':       grp['detected'].mean(),
+        'detection_freq':       grp['detected'].mean().round(4),
         'peak_conc_mean':       grp['peak_conc'].mean().round(4),
         'peak_conc_std':        grp['peak_conc'].std().round(4),
-        'time_to_peak_mean':    grp['time_to_peak_min'].mean().round(2),
+        'time_to_peak_mean':    grp['t_peak_min'].mean().round(2),
+        'mean_flow_m3s':        grp['mean_flow_m3s'].mean().round(6),
         'n_scenarios_detected': grp['detected'].sum().astype(int),
     })
-
-    # Mean flow velocity per node -- approximated from SWMM link data
-    # (populated from simulation; here we use a placeholder derived from
-    #  the conduit roughness and geometry -- to be refined once SWMM is running)
-    node_agg['mean_flow_velocity'] = 0.0   # placeholder -- fill from SWMM output
-
-    # Merge with topology features
-    final_df = topo_df.join(node_agg, how='left')
-    final_df = final_df.reset_index().rename(columns={'index': 'node_id'})
-
+    final_df  = topo_df.join(node_agg, how='left').reset_index()
     feat_path = os.path.join(output_dir, 'node_features.csv')
     final_df.to_csv(feat_path, index=False)
-    print(f"      Saved: {feat_path}  ({len(final_df)} rows, {len(final_df.columns)} columns)")
+    print(f"      {feat_path}  ({len(final_df.columns)} columns)")
 
-    # ── Summary ──
+    # Summary
     print("\n" + "=" * 60)
-    print("DATASET SUMMARY")
+    print("SUMMARY")
     print("=" * 60)
-    print(f"  Scenarios run       : {n_scenarios}")
-    print(f"  Nodes in network    : {len(all_nodes)}")
-    print(f"  Total dataset rows  : {len(raw_df)}")
-    print(f"  Detection rate      : {raw_df['detected'].mean():.1%}")
+    print(f"  Scenarios      : {n_scenarios}")
+    print(f"  Total rows     : {len(raw_df):,}")
+    print(f"  Detection rate : {raw_df['detected'].mean():.1%}")
     print(f"\n  Top 5 nodes by detection frequency:")
-    top5 = (raw_df.groupby('node_id')['detected']
-              .mean()
-              .sort_values(ascending=False)
-              .head(5))
+    top5 = raw_df.groupby('node_id')['detected'].mean().sort_values(ascending=False).head(5)
     for nid, freq in top5.items():
-        print(f"    {nid:<12}  {freq:.3f}")
+        td = topo_depth.get(nid, '?')
+        mf = raw_df[raw_df['node_id']==nid]['mean_flow_m3s'].mean()
+        print(f"    {nid:<10}  freq={freq:.3f}  topo_depth={td}  mean_flow={mf:.5f} m3/s")
 
-    print(f"\n  Output files:")
-    print(f"    {raw_path}")
-    print(f"    {feat_path}")
-    print("\nDone.")
+    print(f"\n  Sample rows (concept note format, detected=1 only):")
+    cols = ['scen_id','src_node','node_id','dist_src','topo_depth',
+            'peak_conc','t_peak_min','mean_flow_m3s','detected']
+    print(raw_df[raw_df['detected']==1][cols].head(8).to_string(index=False))
 
     return raw_df, final_df
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
-
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(
-        description='Generate SWMM contamination scenario dataset for ML training'
-    )
-    parser.add_argument('--inp',        default='Example8.inp',
-                        help='Path to SWMM input file (default: Example8.inp)')
-    parser.add_argument('--n_scenarios',type=int, default=100,
-                        help='Number of scenarios to run (default: 100, use 5000+ for full dataset)')
-    parser.add_argument('--output_dir', default='./output',
-                        help='Directory to save CSV files (default: ./output)')
-    parser.add_argument('--seed',       type=int, default=42,
-                        help='Random seed for reproducibility (default: 42)')
-
-    args = parser.parse_args()
-
-    main(
-        inp_file    = args.inp,
-        n_scenarios = args.n_scenarios,
-        output_dir  = args.output_dir,
-        seed        = args.seed,
-    )
+    p = argparse.ArgumentParser()
+    p.add_argument('--inp',         default='Example8.inp')
+    p.add_argument('--n_scenarios', type=int, default=100)
+    p.add_argument('--output_dir',  default='./output')
+    p.add_argument('--seed',        type=int, default=42)
+    a = p.parse_args()
+    main(a.inp, a.n_scenarios, a.output_dir, a.seed)
