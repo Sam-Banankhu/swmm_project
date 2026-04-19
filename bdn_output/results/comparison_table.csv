@@ -1,8 +1,8 @@
 prior,sensors_placed,convergence_iters,total_updates,F1,F2
-Prior_A_Uniform,"JI5, JI10, JI9","2, 2, 2",6,0.2924,0.5673
-Prior_B_Topo,"JI5, JI9, JI4","1, 2, 2",5,0.1178,0.4374
-Prior_C_Flux,"JI5, JI9, JI4","1, 2, 3",6,0.2408,0.5744
-Prior_D_ContamFlux,"J11, J8, J9","2, 2, 1",5,0.1835,0.5679
-ML_LGBM,"JI5, JI9, JI4","1, 1, 2",4,0.1997,0.4827
-ML_MLP,"JI5, JI10, J2a","2, 3, 2",7,0.3197,0.5207
-ML_XGB,"JI5, JI9, J2","2, 2, 1",5,0.3303,0.3757
+Prior_A_Uniform,"JI5, J11, JI13","2, 2, 1",5,0.7842,0.7842
+Prior_B_Topo,"JI5, J11, J10","2, 1, 2",5,0.4677,0.6792
+Prior_C_Flux,"JI5, JI3, JI8","1, 1, 2",4,0.3207,0.5305
+Prior_D_ContamFlux,"J11, JI5, JI4","2, 2, 1",5,0.7859,0.9094
+ML_LGBM,"JI5, J11, JI4","2, 1, 2",5,0.5619,0.8026
+ML_MLP,"JI5, JI4, JI3","1, 2, 1",4,0.1601,0.4626
+ML_XGB,"J11, J10, J9","1, 1, 2",4,0.0734,0.3905

@@ -243,8 +243,8 @@ J2a              FLOW             ""               DRY      1.0      1.0      0.
 Aux3             FLOW             ""               DRY      1.0      1.0      0.004
 J13              FLOW             ""               DRY      1.0      1.0      0.0123
 J12              FLOW             ""               DRY      1.0      1.0      0.0125
-JI13             FLOW   CarrierFlow_JI13    DIRECT  1.0  1.0
-JI13             CONTAM ContamConc_JI13     CONCEN  1.0  1.0
+J3               FLOW   CarrierFlow_J3      DIRECT  1.0  1.0
+J3               CONTAM ContamConc_J3       CONCEN  1.0  1.0
 
 [CURVES]
 ;;Name           Type       X-Value    Y-Value
@@ -284,18 +284,18 @@ Rain_023in                  0:55       0.28
 Rain_023in                  1:00       0.28
 Rain_023in                  1:05       0.00
 Rain_023in                  12:00      0.00
-CarrierFlow_JI13            00:00       0.0
-CarrierFlow_JI13            04:47       0.0
-CarrierFlow_JI13            04:48       0.01
-CarrierFlow_JI13            06:03       0.01
-CarrierFlow_JI13            06:08       0.0
-CarrierFlow_JI13            12:00       0.0
-ContamConc_JI13             00:00       0.0
-ContamConc_JI13             04:47       0.0
-ContamConc_JI13             04:48       253.17
-ContamConc_JI13             06:03       253.17
-ContamConc_JI13             06:08       0.0
-ContamConc_JI13             12:00       0.0
+CarrierFlow_J3              00:00       0.0
+CarrierFlow_J3              05:19       0.0
+CarrierFlow_J3              05:20       0.01
+CarrierFlow_J3              07:33       0.01
+CarrierFlow_J3              07:38       0.0
+CarrierFlow_J3              12:00       0.0
+ContamConc_J3               00:00       0.0
+ContamConc_J3               05:19       0.0
+ContamConc_J3               05:20       68.32
+ContamConc_J3               07:33       68.32
+ContamConc_J3               07:38       0.0
+ContamConc_J3               12:00       0.0
 
 [REPORT]
 ;;Reporting Options
