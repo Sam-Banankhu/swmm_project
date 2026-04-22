@@ -162,31 +162,51 @@ def build_scenario_inp(base_inp, tmp_inp, src, conc_mg_l, dur_hrs, start_hrs):
     # Remove invalid QUALITY keyword that causes ERROR 205
     content = content.replace('QUALITY    ALL\n', '').replace('QUALITY ALL\n', '')
 
-    # Ensure POLLUTANTS section is present
+    # 1. Ensure [POLLUTANTS] section is present
     if '[POLLUTANTS]' not in content:
         pb = ('[POLLUTANTS]\n'
               ';;Name  Units  Crain  Cgw    Crdii  Kdecay  SnowOnly\n'
               'CONTAM  MG/L   0.0    0.0    0.0    0.0     NO\n\n')
-        content = content.replace('[INFLOWS]', pb + '[INFLOWS]')
+        if '[INFLOWS]' in content:
+            content = content.replace('[INFLOWS]', pb + '[INFLOWS]')
+        elif '[JUNCTIONS]' in content:
+            content = content.replace('[JUNCTIONS]', pb + '[JUNCTIONS]')
+        else:
+            content += "\n" + pb
 
-    out = []; ts_done = inflow_done = False
-    for line in content.splitlines(keepends=True):
-        out.append(line)
-        # Append timeseries after last Rain line
-        if 'Rain_023in' in line and '12:00' in line and not ts_done:
-            for t, v in ts(CARRIER_FLOW):
-                out.append(f'{ts_flow:<28}{t:<12}{v}\n')
-            for t, v in ts(conc_mg_l):
-                out.append(f'{ts_conc:<28}{t:<12}{v}\n')
-            ts_done = True
-        # Append inflow entries after last DWF inflow
-        if 'J12              FLOW' in line and '0.0125' in line and not inflow_done:
-            out.append(f'{src:<17}FLOW   {ts_flow:<20}DIRECT  1.0  1.0\n')
-            out.append(f'{src:<17}CONTAM {ts_conc:<20}CONCEN  1.0  1.0\n')
-            inflow_done = True
+    # 2. Ensure [TIMESERIES] section is present and inject series
+    ts_block = f';; Injection Timeseries for {src}\n'
+    for t, v in ts(CARRIER_FLOW):
+        ts_block += f'{ts_flow:<28}{t:<12}{v}\n'
+    for t, v in ts(conc_mg_l):
+        ts_block += f'{ts_conc:<28}{t:<12}{v}\n'
+
+    if '[TIMESERIES]' in content:
+        parts = content.split('[TIMESERIES]')
+        post_ts = parts[1].split('[', 1)
+        if len(post_ts) > 1:
+            content = parts[0] + '[TIMESERIES]' + post_ts[0] + ts_block + '[' + post_ts[1]
+        else:
+            content = parts[0] + '[TIMESERIES]' + parts[1] + "\n" + ts_block
+    else:
+        content += f"\n[TIMESERIES]\n{ts_block}\n"
+
+    # 3. Ensure [INFLOWS] section is present and inject entries
+    inflow_entry = (f'{src:<17}FLOW   {ts_flow:<20}DIRECT  1.0  1.0\n'
+                    f'{src:<17}CONTAM {ts_conc:<20}CONCEN  1.0  1.0\n')
+    
+    if '[INFLOWS]' in content:
+        parts = content.split('[INFLOWS]')
+        post_in = parts[1].split('[', 1)
+        if len(post_in) > 1:
+            content = parts[0] + '[INFLOWS]' + post_in[0] + inflow_entry + '[' + post_in[1]
+        else:
+            content = parts[0] + '[INFLOWS]' + parts[1] + "\n" + inflow_entry
+    else:
+        content += f"\n[INFLOWS]\n{inflow_entry}\n"
 
     with open(tmp_inp, 'w') as f:
-        f.writelines(out)
+        f.write(content)
 
 
 # ── 5. Run one scenario ────────────────────────────────────────────────────────
