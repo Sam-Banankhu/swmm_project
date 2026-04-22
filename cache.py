@@ -76,5 +76,4 @@ def cached(cache_instance=None):
     return decorator
 
 # Global cache instance
-cache = Cache()</content>
-<parameter name="filePath">c:\Users\kamlo\Desktop\Personal\projects\swmm_project\cache.py
+cache = Cache()

@@ -485,6 +485,8 @@ def main(raw_scenarios_path, node_features_path, priors_dir,
     for prior_name, prior in all_priors.items():
         print(f"\n  Prior: {prior_name}")
 
+        import time
+        start_time = time.time()
         result = greedy_sensor_placement(
             prior      = prior,
             p_kj       = p_kj,
@@ -494,6 +496,7 @@ def main(raw_scenarios_path, node_features_path, priors_dir,
             n_sensors  = n_sensors,
             verbose    = True,
         )
+        inference_time = time.time() - start_time
 
         f1, f2 = compute_f1_f2(
             result["placed_sensors"],
@@ -509,6 +512,7 @@ def main(raw_scenarios_path, node_features_path, priors_dir,
             "total_updates":    total_iters,
             "F1":               f1,
             "F2":               f2,
+            "inference_time_s": round(inference_time, 2),
         })
 
         print(f"    Sensors: {result['placed_sensors']}")
@@ -529,14 +533,15 @@ def main(raw_scenarios_path, node_features_path, priors_dir,
     print("\n" + "=" * 70)
     print("RESULTS SUMMARY")
     print("=" * 70)
-    print(f"{'Prior':<26} {'Sensors':<26} {'Updates':>7} {'F1':>7} {'F2':>7}")
-    print("-" * 70)
+    print(f"{'Prior':<26} {'Sensors':<26} {'Updates':>7} {'F1':>7} {'F2':>7} {'Time(s)':>8}")
+    print("-" * 80)
     for _, row in results_df.sort_values("F1", ascending=False).iterrows():
         sensors_short = row["sensors_placed"][:25]
         print(f"{str(row['prior']):<26} {sensors_short:<26} "
               f"{int(row['total_updates']):>7} "
-              f"{float(row['F1']):>7.4f} {float(row['F2']):>7.4f}")
-    print("=" * 70)
+              f"{float(row['F1']):>7.4f} {float(row['F2']):>7.4f} "
+              f"{float(row['inference_time_s']):>8.2f}")
+    print("=" * 80)
 
     print(f"\nNote: F1 = isolation likelihood | F2 = detection reliability")
     print(f"      Higher is better for both. An ML prior with fewer updates")

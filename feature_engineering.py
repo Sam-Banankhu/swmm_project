@@ -262,6 +262,23 @@ def main(node_features_path, raw_scenarios_path, inp_file, output_path):
     rs = pd.read_csv(raw_scenarios_path)
     print(f"      Rows: {len(rs):,}  |  Unique scenarios: {rs['scen_id'].nunique()}")
 
+    print("\n[2.5/4] Recomputing dynamic features from raw_scenarios to prevent data leakage ...")
+    grp = rs.groupby('node_id')
+    node_agg = pd.DataFrame({
+        'detection_freq':       grp['detected'].mean().round(4),
+        'peak_conc_mean':       grp['peak_conc'].mean().round(4),
+        'peak_conc_std':        grp['peak_conc'].std().round(4),
+        'time_to_peak_mean':    grp['t_peak_min'].mean().round(2),
+        'mean_flow_m3s':        grp['mean_flow_m3s'].mean().round(6),
+        'n_scenarios_detected': grp['detected'].sum().astype(int),
+    }).reset_index()
+    
+    # Drop old dynamic features and merge new ones
+    dyn_cols = ['detection_freq', 'peak_conc_mean', 'peak_conc_std', 'time_to_peak_mean', 'mean_flow_m3s', 'n_scenarios_detected']
+    nf = nf.drop(columns=[c for c in dyn_cols if c in nf.columns])
+    nf = nf.merge(node_agg, on='node_id', how='left').fillna(0)
+
+
     # ── Group 1: flow_diversion_fraction ──────────────────────────────────────
     print("\n[3/4] Computing Group 1 -- flow_diversion_fraction ...")
     frac_dict = compute_flow_diversion_fraction(inp_file, node_list)

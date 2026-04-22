@@ -99,6 +99,7 @@ STATIC_FEATURES = [
     "node_type_code",
     "is_high_risk",
     "prior_contam_prob",
+    "flow_diversion_fraction",
 ]
 
 DYNAMIC_FEATURES = [
@@ -106,6 +107,9 @@ DYNAMIC_FEATURES = [
     "peak_conc_std",
     "time_to_peak_mean",
     "mean_flow_m3s",
+    "mean_wastewater_flux",
+    "mean_contaminant_flux",
+    "contaminant_flux_std",
 ]
 
 ALL_NODE_FEATURES = STATIC_FEATURES + DYNAMIC_FEATURES
@@ -290,6 +294,7 @@ def train_gradient_boosting(X, y, node_ids, candidate_mask, output_dir):
         return {}
 
     from sklearn.preprocessing import StandardScaler
+    import time
 
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
@@ -370,6 +375,7 @@ def train_gradient_boosting(X, y, node_ids, candidate_mask, output_dir):
             }
     else:
         # Original logic without MLflow
+        start_time = time.time()
         xgb_cv = leave_one_out_cv(xgb_fn, X_scaled, y, node_ids)
         print(f"    LOO MAE={xgb_cv['mae']:.4f}  RMSE={xgb_cv['rmse']:.4f}  "
               f"R²={xgb_cv['r2']:.4f}  RankCorr={xgb_cv['rank_corr']:.4f}")
@@ -377,6 +383,7 @@ def train_gradient_boosting(X, y, node_ids, candidate_mask, output_dir):
         # Full-data fit for saving and prior extraction
         xgb_model = xgb.XGBRegressor(**xgb_params)
         xgb_model.fit(X_scaled, y)
+        train_time_xgb = time.time() - start_time
         model_path = os.path.join(output_dir, "models", "xgb_model.json")
         xgb_model.save_model(model_path)
         print(f"    Saved: {model_path}")
@@ -394,6 +401,7 @@ def train_gradient_boosting(X, y, node_ids, candidate_mask, output_dir):
 
         results["xgb"] = {
             "model": "XGBoost",
+            "train_time_s": round(train_time_xgb, 2),
             **{k: v for k, v in xgb_cv.items() if k != "preds"},
         }
 
@@ -418,12 +426,14 @@ def train_gradient_boosting(X, y, node_ids, candidate_mask, output_dir):
     def lgbm_fn():
         return lgbm.LGBMRegressor(**lgbm_params)
 
+    start_time = time.time()
     lgbm_cv = leave_one_out_cv(lgbm_fn, X_scaled, y, node_ids)
     print(f"    LOO MAE={lgbm_cv['mae']:.4f}  RMSE={lgbm_cv['rmse']:.4f}  "
           f"R²={lgbm_cv['r2']:.4f}  RankCorr={lgbm_cv['rank_corr']:.4f}")
 
     lgbm_model = lgbm.LGBMRegressor(**lgbm_params)
     lgbm_model.fit(X_scaled, y)
+    train_time_lgbm = time.time() - start_time
     model_path = os.path.join(output_dir, "models", "lgbm_model.txt")
     lgbm_model.booster_.save_model(model_path)
     print(f"    Saved: {model_path}")
@@ -446,6 +456,7 @@ def train_gradient_boosting(X, y, node_ids, candidate_mask, output_dir):
 
     results["lgbm"] = {
         "model": "LightGBM",
+        "train_time_s": round(train_time_lgbm, 2),
         **{k: v for k, v in lgbm_cv.items() if k != "preds"},
     }
 
@@ -474,6 +485,7 @@ def train_mlp(X, y, node_ids, candidate_mask, output_dir):
         from sklearn.preprocessing import StandardScaler
         from sklearn.model_selection import KFold
         from sklearn.metrics import mean_absolute_error, r2_score
+        import time
     except (ImportError, OSError):
         print("  [SKIP] PyTorch not installed or not loadable. Run: pip install torch")
         return {}
@@ -520,6 +532,7 @@ def train_mlp(X, y, node_ids, candidate_mask, output_dir):
     kf   = KFold(n_splits=5, shuffle=True, random_state=SEED)
     preds_all = np.zeros(len(y_arr))
 
+    start_time = time.time()
     for fold, (tr_idx, val_idx) in enumerate(kf.split(X_scaled)):
         model = train_one(X_scaled[tr_idx], y_arr[tr_idx])
         model.eval()
@@ -539,6 +552,7 @@ def train_mlp(X, y, node_ids, candidate_mask, output_dir):
 
     # Full-data fit for saving
     full_model = train_one(X_scaled, y_arr, n_epochs=500)
+    train_time_mlp = time.time() - start_time
     model_path = os.path.join(output_dir, "models", "mlp_model.pt")
     torch.save({
         "state_dict": full_model.state_dict(),
@@ -556,6 +570,7 @@ def train_mlp(X, y, node_ids, candidate_mask, output_dir):
     return {
         "mlp": {
             "model": "MLP",
+            "train_time_s": round(train_time_mlp, 2),
             "mae":       round(float(mae),       4),
             "rmse":      round(float(rmse),      4),
             "r2":        round(float(r2),        4),
@@ -595,6 +610,7 @@ def train_gnn(X, y, node_ids, candidate_mask, edge_index, edge_attr, output_dir)
         from torch_geometric.nn import GCNConv, GATConv
         from sklearn.preprocessing import StandardScaler
         from sklearn.metrics import mean_absolute_error, r2_score
+        import time
     except (ImportError, OSError):
         print("  [SKIP] torch-geometric not installed.")
         print("         Run: pip install torch-geometric")
@@ -723,11 +739,13 @@ def train_gnn(X, y, node_ids, candidate_mask, edge_index, edge_attr, output_dir)
 
     for name, ModelClass in [("GCN", GCNModel), ("GAT", GATModel)]:
         print(f"  Training {name} (Monte Carlo CV, 10 repeats) ...")
+        start_time = time.time()
         cv_metrics = mc_cv_gnn(ModelClass)
         print(f"    MC-CV MAE={cv_metrics['mae']:.4f}  RMSE={cv_metrics['rmse']:.4f}  "
               f"R²={cv_metrics['r2']:.4f}  RankCorr={cv_metrics['rank_corr']:.4f}")
 
         full_model = train_gnn_model(ModelClass, n_epochs=500)
+        train_time_gnn = time.time() - start_time
         model_path = os.path.join(output_dir, "models", f"{name.lower()}_model.pt")
         torch.save({
             "state_dict": full_model.state_dict(),
@@ -747,7 +765,7 @@ def train_gnn(X, y, node_ids, candidate_mask, edge_index, edge_attr, output_dir)
         prior_df.to_csv(prior_path, index=False)
         print(f"    Prior saved: {prior_path}")
 
-        results[name.lower()] = {"model": name, **cv_metrics}
+        results[name.lower()] = {"model": name, "train_time_s": round(train_time_gnn, 2), **cv_metrics}
 
     return results
 

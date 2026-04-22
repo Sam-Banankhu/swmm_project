@@ -13,5 +13,4 @@ onnxruntime>=1.14.0
 onnxmltools>=1.11.0
 skl2onnx>=1.15.0
 joblib>=1.2.0
-pyyaml>=6.0</content>
-<parameter name="filePath">c:\Users\kamlo\Desktop\Personal\projects\swmm_project\requirements.txt
+pyyaml>=6.0
