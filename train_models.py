@@ -132,9 +132,16 @@ def load_node_features(path):
     df = pd.read_csv(path)
     df = df.fillna(0)
 
-    # Exclude outfalls and storage from training — they are not sensor candidates.
-    # Keep them for the prior normalisation step so all 31 nodes get a prior value.
-    df["is_candidate"] = df["node_type"].isin(["J", "JI", "aux"]).astype(int)
+    # Exclude outfalls/storage from training — they are not sensor candidates.
+    # Support both: legacy 'node_type' text column AND new 'node_type_code' int column.
+    # node_type_code: 0 = J (junction), 1 = JI (interceptor), 3 = outfall/storage
+    if "node_type" in df.columns:
+        df["is_candidate"] = df["node_type"].isin(["J", "JI", "aux"]).astype(int)
+    elif "node_type_code" in df.columns:
+        df["is_candidate"] = df["node_type_code"].isin([0, 1]).astype(int)
+    else:
+        # No type info available — treat all nodes as candidates
+        df["is_candidate"] = 1
 
     return df
 

@@ -81,12 +81,21 @@ def load_data(raw_scenarios_path, node_features_path):
     nf = pd.read_csv(node_features_path).fillna(0)
     node_list = nf["node_id"].tolist()
 
-    candidate_sensors = [
-        n for n in node_list
-        if n not in EXCLUDE_SENSORS
-        and nf.loc[nf["node_id"] == n, "node_type"].values[0]
-           in ("J", "JI", "aux")
-    ]
+    if "node_type" in nf.columns:
+        candidate_sensors = [
+            n for n in node_list
+            if n not in EXCLUDE_SENSORS
+            and nf.loc[nf["node_id"] == n, "node_type"].values[0] in ("J", "JI", "aux")
+        ]
+    else:
+        # Fallback: use node_type_code (0=J, 1=JI, 3=outfall)
+        candidate_sensors = [
+            n for n in node_list
+            if n not in EXCLUDE_SENSORS
+            and nf.loc[nf["node_id"] == n, "node_type_code"].values[0] in (0, 1)
+        ] if "node_type_code" in nf.columns else [
+            n for n in node_list if n not in EXCLUDE_SENSORS
+        ]
 
     candidate_sources = rs["src_node"].unique().tolist()
 
