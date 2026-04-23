@@ -33,4 +33,9 @@ Record.dat
 # IDEs
 .vscode/
 .idea/
-.DS_Store
+*.log
+*.sqlite3
+*.env
+.env.*
+*.bak
+*.tmp
