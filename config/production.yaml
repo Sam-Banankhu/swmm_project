@@ -1,0 +1,23 @@
+# Production configuration
+environment: production
+
+dataset:
+    n_scenarios: 5000 # Large dataset for production
+    parallel:
+        enabled: true
+        n_workers: null # Use all cores
+
+ml:
+    models:
+        gnn:
+            enabled: true # Enable GNN in production
+
+    tracking:
+        enabled: true
+        experiment_name: "swmm_sensor_placement_prod"
+
+cache:
+    enabled: true
+
+logging:
+    level: "WARNING"

@@ -1,0 +1,19 @@
+# Development configuration
+environment: development
+
+# Override defaults for development
+dataset:
+    n_scenarios: 30 # Smaller dataset for faster iteration
+    parallel:
+        enabled: false # Disable parallel for easier debugging
+
+ml:
+    models:
+        gnn:
+            enabled: false # Skip GNN in development
+
+cache:
+    enabled: false # Disable caching in development
+
+logging:
+    level: "DEBUG"

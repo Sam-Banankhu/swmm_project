@@ -1,386 +1,285 @@
-"""
-dataset_generator.py
-====================
-Generates the ML training dataset for the Hybrid AI sensor placement project.
-Sambito & Mhango (2026)
-
-raw_scenarios.csv columns (matches concept note exactly):
-  scen_id        scenario number
-  src_node       injection node
-  node_id        observed node
-  dist_src       pipe-segment distance from src_node to node_id
-  topo_depth     shortest directed path from node_id to nearest outfall
-  peak_conc      peak concentration at node_id (mg/L)
-  t_peak_min     time from injection start to peak (minutes); blank if none
-  mean_flow_m3s  mean total inflow at node_id during scenario (m3/s)
-  detected       1 if peak_conc >= 5 mg/L, else 0
-  mass_kg / duration_hrs / start_hrs / conc_injected  (scenario parameters)
-
-Usage:
-  python dataset_generator.py --n_scenarios 100 --output_dir ./output
-  python dataset_generator.py --n_scenarios 5000 --output_dir ./output
-
-Requirements:
-  pip install pyswmm swmm-toolkit networkx pandas numpy
-"""
-
-import os, argparse, random, warnings
+import os
+import sys
+import argparse
+import random
+import yaml
+import uuid
+import time
+import datetime
 import numpy as np
 import pandas as pd
-import networkx as nx
-from swmm.toolkit.solver import swmm_open, swmm_close, swmm_start, swmm_step, swmm_end
-from swmm.toolkit import solver as slv
+from concurrent.futures import ProcessPoolExecutor
+from pyswmm import Simulation, Nodes, Links
 
-warnings.filterwarnings('ignore')
+# ── 1. Constants ──────────────────────────────────────────────────────────────
+CFS_TO_M3S = 0.0283168
 
-# ── Configuration ──────────────────────────────────────────────────────────────
-THRESHOLD       = 5.0        # mg/L
-CARRIER_FLOW    = 0.01       # cfs
-CFS_TO_M3S      = 0.028317
-MASS_MIN, MASS_MAX          = 0.01, 0.50    # kg
-DURATION_MIN, DURATION_MAX  = 0.25, 3.0    # hours
-START_MIN, START_MAX        = 0.0,  6.0    # hours
-HIGH_RISK_NODES = {'J4', 'J10', 'JI18'}
-EXCLUDE_SOURCE  = {'O1', 'O2', 'Well'}
+def load_config(config_path="config/default.yaml"):
+    if not os.path.exists(config_path): return None
+    with open(config_path, 'r') as f: return yaml.safe_load(f)
 
+def format_time(hrs):
+    h = int(hrs)
+    m = int((hrs - h) * 60)
+    s = int(((hrs - h) * 60 - m) * 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
 
-# ── 1. Parse network ───────────────────────────────────────────────────────────
-def parse_network(inp_file):
-    nodes, outfalls, storage, links = [], [], [], []
-    section = None
-    with open(inp_file) as f:
+# ── 2. Topology ───────────────────────────────────────────────────────────────
+def build_topology_features(inp_path, high_risk_nodes=None):
+    import networkx as nx
+    G = nx.DiGraph()
+    outfalls = []
+    high_risk_nodes = set(high_risk_nodes or [])
+    
+    with open(inp_path) as f:
+        section = None
         for line in f:
-            s = line.strip()
-            if not s or s.startswith(';;'): continue
-            if s.startswith('['):
-                section = s.strip('[]').upper(); continue
-            parts = s.split()
-            if not parts: continue
-            if section == 'JUNCTIONS':  nodes.append(parts[0])
-            elif section == 'OUTFALLS': outfalls.append(parts[0]); nodes.append(parts[0])
-            elif section == 'STORAGE':  storage.append(parts[0]);  nodes.append(parts[0])
-            elif section in ('CONDUITS','PUMPS','WEIRS','ORIFICES'):
-                if len(parts) >= 3: links.append((parts[1], parts[2]))
+            s = line.strip().upper()
+            if not s or s.startswith(';'): continue
+            if s.startswith('['): section = s.strip('[]'); continue
+            parts = line.split()
+            if section == 'CONDUITS' and len(parts) >= 3: G.add_edge(parts[1], parts[2])
+            if section == 'OUTFALLS' and len(parts) >= 1: outfalls.append(parts[0])
 
-    def ntype(n):
-        if n in outfalls:      return 'outfall'
-        if n in storage:       return 'storage'
-        if n == 'Aux3':        return 'aux'
-        if n.startswith('JI'): return 'JI'
-        if n.startswith('J'):  return 'J'
-        return 'other'
-
-    node_types = {n: ntype(n) for n in nodes}
-
-    G_dir = nx.DiGraph(); G_dir.add_nodes_from(nodes)
-    G_und = nx.Graph();   G_und.add_nodes_from(nodes)
-    for f, t in links:
-        if f in G_dir and t in G_dir:
-            G_dir.add_edge(f, t)
-            G_und.add_edge(f, t)
-
-    return nodes, outfalls, node_types, G_dir, G_und
-
-
-# ── 2. Topology distances ──────────────────────────────────────────────────────
-def compute_topo_depth(nodes, outfalls, G_dir):
-    depth = {}
-    for n in nodes:
-        best = 999
-        for o in outfalls:
-            try: best = min(best, nx.shortest_path_length(G_dir, n, o))
+    topo_depth = {}
+    nodes = list(G.nodes())
+    for node in nodes:
+        min_d = 999
+        for out in outfalls:
+            try:
+                d = nx.shortest_path_length(G, node, out); 
+                if d < min_d: min_d = d
             except: pass
-        depth[n] = best
-    return depth
-
-def compute_dist_matrix(nodes, G_und):
-    return dict(nx.all_pairs_shortest_path_length(G_und))
-
-
-# ── 3. Static feature table ────────────────────────────────────────────────────
-def build_topology_features(nodes, outfalls, node_types, G_dir, topo_depth):
-    bc       = nx.betweenness_centrality(G_dir, normalized=True)
-    type_map = {'J':0, 'JI':1, 'aux':2, 'outfall':3, 'storage':4, 'other':5}
-    n_high   = len(HIGH_RISK_NODES)
-    base_p   = 1.0 / (len(nodes) + n_high)
-    high_p   = 2.0 * base_p
-
-    def down_paths(n):
-        c = 0
-        for o in outfalls:
-            try: c += len(list(nx.all_simple_paths(G_dir, n, o, cutoff=20)))
-            except: pass
-        return c
+        topo_depth[node] = min_d if min_d != 999 else 0
 
     rows = []
-    for n in nodes:
+    for node in nodes:
+        n_up = len(nx.ancestors(G, node))
+        nt = 1 if node.startswith('JI') else (3 if node in outfalls else 0)
         rows.append({
-            'node_id':          n,
-            'topo_depth':       topo_depth[n],
-            'n_upstream_nodes': len(nx.ancestors(G_dir, n)),
-            'betweenness':      round(bc.get(n, 0), 6),
-            'downstream_paths': down_paths(n),
-            'node_type':        node_types[n],
-            'node_type_code':   type_map.get(node_types[n], 5),
-            'is_high_risk':     1 if n in HIGH_RISK_NODES else 0,
-            'prior_contam_prob': high_p if n in HIGH_RISK_NODES else base_p,
+            'node_id': node, 'topo_depth': topo_depth[node], 'n_upstream': n_up,
+            'node_type_code': nt, 'is_high_risk': 1 if node in high_risk_nodes else 0,
+            'prior_contam_prob': 2.0 if node in high_risk_nodes else 1.0
         })
-    return pd.DataFrame(rows).set_index('node_id')
+    df = pd.DataFrame(rows).set_index('node_id')
+    df['prior_contam_prob'] /= df['prior_contam_prob'].sum()
+    return df, topo_depth
 
-
-# ── 4. Scenario .inp builder ───────────────────────────────────────────────────
-def format_time(hours):
-    hours = min(max(hours, 0.0), 11.99)
-    h = int(hours); m = int(round((hours - h) * 60))
-    if m == 60: h += 1; m = 0
-    return f"{h:02d}:{m:02d}"
-
-def build_scenario_inp(base_inp, tmp_inp, src, conc_mg_l, dur_hrs, start_hrs):
-    end_hrs  = start_hrs + dur_hrs
-    pre_hrs  = max(0.0, start_hrs - 1.0/60.0)
-    post_hrs = end_hrs + 5.0/60.0
-
-    def ts(val):
-        return [
-            ("00:00",                0.0),
-            (format_time(pre_hrs),   0.0),
-            (format_time(start_hrs), val),
-            (format_time(end_hrs),   val),
-            (format_time(post_hrs),  0.0),
-            ("12:00",                0.0),
-        ]
-
-    ts_flow = f'CarrierFlow_{src}'
-    ts_conc = f'ContamConc_{src}'
-
-    with open(base_inp) as f:
-        content = f.read()
-
-    # Remove invalid QUALITY keyword that causes ERROR 205
-    content = content.replace('QUALITY    ALL\n', '').replace('QUALITY ALL\n', '')
-
-    # Ensure POLLUTANTS section is present
-    if '[POLLUTANTS]' not in content:
-        pb = ('[POLLUTANTS]\n'
-              ';;Name  Units  Crain  Cgw    Crdii  Kdecay  SnowOnly\n'
-              'CONTAM  MG/L   0.0    0.0    0.0    0.0     NO\n\n')
-        content = content.replace('[INFLOWS]', pb + '[INFLOWS]')
-
-    out = []; ts_done = inflow_done = False
-    for line in content.splitlines(keepends=True):
-        out.append(line)
-        # Append timeseries after last Rain line
-        if 'Rain_023in' in line and '12:00' in line and not ts_done:
-            for t, v in ts(CARRIER_FLOW):
-                out.append(f'{ts_flow:<28}{t:<12}{v}\n')
-            for t, v in ts(conc_mg_l):
-                out.append(f'{ts_conc:<28}{t:<12}{v}\n')
-            ts_done = True
-        # Append inflow entries after last DWF inflow
-        if 'J12              FLOW' in line and '0.0125' in line and not inflow_done:
-            out.append(f'{src:<17}FLOW   {ts_flow:<20}DIRECT  1.0  1.0\n')
-            out.append(f'{src:<17}CONTAM {ts_conc:<20}CONCEN  1.0  1.0\n')
-            inflow_done = True
-
-    with open(tmp_inp, 'w') as f:
-        f.writelines(out)
-
-
-# ── 5. Run one scenario ────────────────────────────────────────────────────────
-def run_scenario(tmp_inp, node_ids):
-    """
-    Run SWMM using the low-level swmm.toolkit API.
-    Collects per-node: peak_conc, t_peak_min, mean_flow_m3s, detected.
-    node_get_pollutant(i, 0)[0]  -> CONTAM concentration
-    node_get_result(i, 0)        -> total inflow (cfs)
-    """
-    rpt, outf = tmp_inp.replace('.inp','.rpt'), tmp_inp.replace('.inp','.out')
-    results   = {}
-
+# ── 3. Scenario Worker ────────────────────────────────────────────────────────
+def worker_run_scenario(args):
+    (scen_id, base_inp, src, mass_kg, duration_hrs, start_offset_hrs, carrier_flow, node_ids, threshold) = args
+    
+    unique_id = uuid.uuid4().hex[:8]
+    tmp_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tmp")
+    os.makedirs(tmp_dir, exist_ok=True)
+    
+    tmp_inp = os.path.join(tmp_dir, f"_scen_{unique_id}.inp")
+    tmp_rpt = os.path.join(tmp_dir, f"_scen_{unique_id}.rpt")
+    tmp_out = os.path.join(tmp_dir, f"_scen_{unique_id}.out")
+    
     try:
-        swmm_open(tmp_inp, rpt, outf)
-        swmm_start(True)
+        # 1. Build Inp
+        vol_m3 = carrier_flow * (duration_hrs * 3600)
+        conc_mg_l = (mass_kg * 1e6) / vol_m3
+        
+        ts_flow = f'F_{src}'
+        ts_conc = f'C_{src}'
+        
+        with open(base_inp) as f: content = f.read()
+        
+        # Path fixes
+        base_dir = os.path.dirname(os.path.abspath(base_inp))
+        lines = content.split('\n')
+        new_lines = []
+        for line in lines:
+            if line.strip() and not line.startswith('[') and not line.startswith(';'):
+                parts = line.split()
+                if 'FILE' in [p.upper() for p in parts]:
+                    f_idx = [p.upper() for p in parts].index('FILE')
+                    if f_idx + 1 < len(parts):
+                        fn_raw = parts[f_idx+1]
+                        fn = fn_raw.strip('"')
+                        if not os.path.isabs(fn):
+                            line = line.replace(fn_raw, f'"{os.path.join(base_dir, fn)}"')
+            new_lines.append(line)
+        content = '\n'.join(new_lines)
 
-        n_count   = slv.project_get_count(slv.swmm_NODE)
-        ids_order = [slv.project_get_id(slv.swmm_NODE, i) for i in range(n_count)]
+        # Optimize simulation window to exactly match injection + wash-out buffer (3 hours)
+        buffer_hrs = 3.0
+        total_sim_hrs = start_offset_hrs + duration_hrs + buffer_hrs
+        
+        start_dt = datetime.datetime(1968, 1, 1, 0, 0, 0)
+        end_dt = start_dt + datetime.timedelta(hours=total_sim_hrs)
+        end_date_str = end_dt.strftime("%m/%d/%Y")
+        end_time_str = end_dt.strftime("%H:%M:%S")
 
-        peaks      = {nid: 0.0 for nid in ids_order}
-        peak_step  = {nid: 0   for nid in ids_order}
-        inflow_sum = {nid: 0.0 for nid in ids_order}
-        step_n = 0
+        if '[OPTIONS]' in content:
+            opt_parts = content.split('[OPTIONS]', 1)
+            rest = opt_parts[1].split('[', 1)
+            opts = rest[0].split('\n')
+            new_opts = []
+            for o in opts:
+                if 'START_DATE' in o.upper():   new_opts.append("START_DATE           01/01/1968")
+                elif 'START_TIME' in o.upper(): new_opts.append("START_TIME           00:00:00")
+                elif 'END_DATE' in o.upper():   new_opts.append(f"END_DATE             {end_date_str}")
+                elif 'END_TIME' in o.upper():   new_opts.append(f"END_TIME             {end_time_str}")
+                else: new_opts.append(o)
+            content = opt_parts[0] + '[OPTIONS]' + '\n'.join(new_opts) + (('[' + rest[1]) if len(rest)>1 else '')
 
-        while True:
-            t = swmm_step()
-            if t == 0: break
-            step_n += 1
-            for i, nid in enumerate(ids_order):
-                # concentration
-                c = slv.node_get_pollutant(i, 0)[0]
-                if c > peaks[nid]:
-                    peaks[nid]     = c
-                    peak_step[nid] = step_n
-                # inflow (cfs)
-                inflow_sum[nid] += abs(slv.node_get_result(i, 0))
+        # Pollutants
+        if '[POLLUTANTS]' not in content:
+            pb = "[POLLUTANTS]\nCONTAM MG/L 0 0 0 0 NO * 0 0 0\n\n"
+            content = content.replace('[JUNCTIONS]', pb + '[JUNCTIONS]')
 
-        swmm_end()
-        swmm_close()
+        # Timeseries
+        ts_data = f"{ts_flow} 0:00 0\n{ts_flow} {format_time(start_offset_hrs)} {carrier_flow}\n" \
+                  f"{ts_flow} {format_time(start_offset_hrs+duration_hrs)} {carrier_flow}\n" \
+                  f"{ts_flow} {format_time(start_offset_hrs+duration_hrs+0.01)} 0\n" \
+                  f"{ts_conc} 0:00 0\n{ts_conc} {format_time(start_offset_hrs)} {conc_mg_l}\n" \
+                  f"{ts_conc} {format_time(start_offset_hrs+duration_hrs)} {conc_mg_l}\n" \
+                  f"{ts_conc} {format_time(start_offset_hrs+duration_hrs+0.01)} 0\n"
+        if '[TIMESERIES]' in content:
+            content = content.replace('[TIMESERIES]', f'[TIMESERIES]\n{ts_data}')
+        else:
+            content += f"\n[TIMESERIES]\n{ts_data}\n"
 
-        for nid in node_ids:
-            peak  = peaks.get(nid, 0.0)
-            pstep = peak_step.get(nid, 0)
-            mflow = round((inflow_sum.get(nid, 0.0) / max(step_n, 1)) * CFS_TO_M3S, 6)
-            results[nid] = {
-                'peak_conc':     round(peak, 4),
-                't_peak_min':    round(pstep * 15.0 / 60.0, 2) if peak > 0 else None,
-                'mean_flow_m3s': mflow,
-                'detected':      1 if peak >= THRESHOLD else 0,
-            }
+        # Inflows
+        inflow = f"{src} FLOW {ts_flow} DIRECT 1.0 1.0\n{src} CONTAM {ts_conc} CONCEN 1.0 1.0\n"
+        if '[INFLOWS]' in content:
+            content = content.replace('[INFLOWS]', f'[INFLOWS]\n{inflow}')
+        else:
+            content += f"\n[INFLOWS]\n{inflow}\n"
 
+        with open(tmp_inp, 'w') as f: f.write(content)
+
+        # 2. Run
+        results = []
+        with Simulation(tmp_inp) as sim:
+            nodes_obj = Nodes(sim)
+            links_obj = Links(sim)
+            n2l = {nid: [l.linkid for l in links_obj if l.inlet_node == nid or l.outlet_node == nid] for nid in node_ids}
+            
+            peaks = {nid: 0.0 for nid in node_ids}
+            p_step = {nid: 0 for nid in node_ids}
+            i_sum = {nid: 0.0 for nid in node_ids}
+            v_sum = {nid: 0.0 for nid in node_ids}
+            steps = 0
+            
+            for _ in sim:
+                steps += 1
+                for nid in node_ids:
+                    node = nodes_obj[nid]
+                    c = node.pollut_quality['CONTAM']
+                    if c > peaks[nid]: peaks[nid] = c; p_step[nid] = steps
+                    i_sum[nid] += abs(node.total_inflow)
+                    v_node = 0.0
+                    if n2l[nid]:
+                        for lid in n2l[nid]:
+                            l = links_obj[lid]
+                            try:
+                                a = getattr(l, 'ups_xsection_area', 0.0) or getattr(l, 'ds_xsection_area', 0.0)
+                                if a > 0.001: v_node += abs(l.flow) / a
+                            except: pass
+                        v_sum[nid] += (v_node / len(n2l[nid]))
+
+            for nid in node_ids:
+                results.append({
+                    'scen_id': scen_id, 'src_node': src, 'node_id': nid,
+                    'peak_conc': round(peaks[nid], 4),
+                    't_peak_min': p_step[nid] if peaks[nid] > 0 else None,
+                    'mean_flow_m3s': round((i_sum[nid] / max(steps, 1)) * CFS_TO_M3S, 6),
+                    'mean_vel_ms': round((v_sum[nid] / max(steps, 1)) * 0.3048, 6),
+                    'detected': 1 if peaks[nid] >= threshold else 0
+                })
+        
+        return results
     except Exception as e:
-        print(f"    WARNING: simulation failed -- {e}")
-        for nid in node_ids:
-            results[nid] = {
-                'peak_conc': 0.0, 't_peak_min': None,
-                'mean_flow_m3s': 0.0, 'detected': 0,
-            }
+        # print(f"Error in worker {scen_id}: {e}")
+        return None
     finally:
-        for f in [rpt, outf]:
-            try: os.remove(f)
+        for f in [tmp_inp, tmp_rpt, tmp_out]:
+            try: 
+                if os.path.exists(f): os.remove(f)
             except: pass
 
-    return results
+# ── 4. Main ───────────────────────────────────────────────────────────────────
+def main():
+    config = load_config()
+    p = argparse.ArgumentParser()
+    p.add_argument('--model_path',  default=config['dataset']['model_path'] if config else './dataset/Examples/Example8.inp')
+    p.add_argument('--n_scenarios', type=int, default=config['dataset']['n_scenarios'] if config else 100)
+    p.add_argument('--output_dir',  default=config['dataset']['output_dir'] if config else './output')
+    p.add_argument('--workers',     type=int, default=os.cpu_count())
+    a = p.parse_args()
 
+    os.makedirs(a.output_dir, exist_ok=True)
+    random.seed(42); np.random.seed(42)
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
-def sampling_weights(candidates):
-    w = [2 if n in HIGH_RISK_NODES else 1 for n in candidates]
-    t = sum(w)
-    return candidates, [x / t for x in w]
+    topo_df, topo_depth = build_topology_features(a.model_path, config['dataset'].get('high_risk_nodes', []))
+    node_ids = list(topo_df.index)
+    exclude = config['dataset'].get('exclude_sources', [])
+    candidates = [n for n in node_ids if n not in exclude]
+    
+    probs = [topo_df.loc[n, 'prior_contam_prob'] for n in candidates]
+    probs = np.array(probs) / sum(probs)
 
-def mass_to_conc(mass_kg, dur_hrs):
-    vol = CARRIER_FLOW * (dur_hrs * 3600) * 28.317
-    return round((mass_kg * 1e6) / max(vol, 1e-9), 2)
+    tasks = []
+    for i in range(a.n_scenarios):
+        src = np.random.choice(candidates, p=probs)
+        mass = round(random.uniform(*config['dataset'].get('mass_range', [0.01, 0.5])), 3)
+        dur = round(random.uniform(*config['dataset'].get('duration_range', [0.25, 3.0])), 2)
+        start = round(random.uniform(*config['dataset'].get('start_range', [0.0, 6.0])), 2)
+        tasks.append((f"{i+1:04d}", a.model_path, src, mass, dur, start, 
+                      config['dataset'].get('carrier_flow', 0.005), node_ids, 
+                      config['dataset'].get('threshold', 5.0)))
 
+    print(f"Generating {a.n_scenarios} scenarios using {a.workers} workers...")
+    print("Press Ctrl+C to safely cancel and save progress.\n")
+    
+    all_results = []
+    start_time = time.time()
+    
+    try:
+        with ProcessPoolExecutor(max_workers=a.workers) as executor:
+            for idx, res in enumerate(executor.map(worker_run_scenario, tasks)):
+                if res: all_results.extend(res)
+                
+                # Timer and ETA calculation
+                c = idx + 1
+                if c % max(1, a.n_scenarios // 100) == 0 or c == a.n_scenarios:
+                    elapsed = time.time() - start_time
+                    rate = c / elapsed
+                    rem_sec = (a.n_scenarios - c) / rate if rate > 0 else 0
+                    
+                    el_str = str(datetime.timedelta(seconds=int(elapsed)))
+                    rem_str = str(datetime.timedelta(seconds=int(rem_sec)))
+                    
+                    print(f"  Progress: {c}/{a.n_scenarios} | "
+                          f"Elapsed: {el_str} | ETA: {rem_str} | Rate: {rate:.2f} scen/s", end='\r')
+    except KeyboardInterrupt:
+        print("\n\nProcess cancelled by user. Saving partial results...")
+    
+    print() # Newline after progress bar
+    if not all_results:
+        print("No results generated.")
+        return
 
-# ── Main ───────────────────────────────────────────────────────────────────────
-def main(inp_file, n_scenarios, output_dir, seed=42):
-    random.seed(seed); np.random.seed(seed)
-    os.makedirs(output_dir, exist_ok=True)
-
-    print("=" * 60)
-    print("SWMM Dataset Generator  --  Mhango & Sambito (2026)")
-    print("=" * 60)
-
-    # Parse
-    print("\n[1/5] Parsing network...")
-    nodes, outfalls, node_types, G_dir, G_und = parse_network(inp_file)
-    candidates = [n for n in nodes
-                  if n not in EXCLUDE_SOURCE
-                  and node_types[n] not in ('outfall', 'storage')]
-    print(f"      Nodes: {len(nodes)}  |  Candidate sources: {len(candidates)}")
-
-    # Distances
-    print("\n[2/5] Computing topology distances...")
-    topo_depth  = compute_topo_depth(nodes, outfalls, G_dir)
-    dist_matrix = compute_dist_matrix(nodes, G_und)
-    topo_df     = build_topology_features(nodes, outfalls, node_types, G_dir, topo_depth)
-    valid_depths = [v for v in topo_depth.values() if v < 999]
-    print(f"      topo_depth range: {min(valid_depths)} to {max(valid_depths)}")
-
-    # Scenarios
-    src_nodes, src_probs = sampling_weights(candidates)
-    tmp_inp = os.path.join(os.path.dirname(inp_file), '_scenario_tmp.inp')
-
-    print(f"\n[3/5] Running {n_scenarios} scenarios...")
-    raw_rows = []
-
-    for i in range(n_scenarios):
-        src      = np.random.choice(src_nodes, p=src_probs)
-        mass_kg  = random.uniform(MASS_MIN, MASS_MAX)
-        dur_hrs  = random.uniform(DURATION_MIN, DURATION_MAX)
-        start_hr = random.uniform(START_MIN, START_MAX)
-        conc     = mass_to_conc(mass_kg, dur_hrs)
-
-        if (i + 1) % 10 == 0 or i == 0:
-            print(f"  Scenario {i+1:>5}/{n_scenarios}  "
-                  f"src={src:<8} mass={mass_kg:.3f}kg  "
-                  f"dur={dur_hrs:.2f}h  conc={conc:.1f}mg/L")
-
-        build_scenario_inp(inp_file, tmp_inp, src, conc, dur_hrs, start_hr)
-        res = run_scenario(tmp_inp, nodes)
-
-        for nid in nodes:
-            r = res[nid]
-            raw_rows.append({
-                'scen_id':       i + 1,
-                'src_node':      src,
-                'mass_kg':       round(mass_kg, 4),
-                'duration_hrs':  round(dur_hrs, 3),
-                'start_hrs':     round(start_hr, 3),
-                'conc_injected': conc,
-                'node_id':       nid,
-                'dist_src':      dist_matrix.get(src, {}).get(nid, 999),
-                'topo_depth':    topo_depth[nid],
-                'peak_conc':     r['peak_conc'],
-                't_peak_min':    r['t_peak_min'],
-                'mean_flow_m3s': r['mean_flow_m3s'],
-                'detected':      r['detected'],
-            })
-
-    try: os.remove(tmp_inp)
-    except: pass
-    print(f"\n  Done. Total rows: {len(raw_rows):,}")
-
-    # Save raw
-    print("\n[4/5] Saving raw_scenarios.csv...")
-    raw_df   = pd.DataFrame(raw_rows)
-    raw_path = os.path.join(output_dir, 'raw_scenarios.csv')
-    raw_df.to_csv(raw_path, index=False)
-    print(f"      {raw_path}  ({len(raw_df):,} rows)")
-
-    # Build node_features
-    print("\n[5/5] Building node_features.csv...")
-    grp = raw_df.groupby('node_id')
+    df = pd.DataFrame(all_results)
+    df.to_csv(os.path.join(a.output_dir, 'raw_scenarios.csv'), index=False)
+    
+    # Aggregation
+    grp = df.groupby('node_id')
     node_agg = pd.DataFrame({
-        'detection_freq':       grp['detected'].mean().round(4),
-        'peak_conc_mean':       grp['peak_conc'].mean().round(4),
-        'peak_conc_std':        grp['peak_conc'].std().round(4),
-        'time_to_peak_mean':    grp['t_peak_min'].mean().round(2),
-        'mean_flow_m3s':        grp['mean_flow_m3s'].mean().round(6),
-        'n_scenarios_detected': grp['detected'].sum().astype(int),
+        'detection_freq': grp['detected'].mean().round(4),
+        'peak_conc_mean': grp['peak_conc'].mean().round(4),
+        'peak_conc_std':  grp['peak_conc'].std().round(4),
+        'time_to_peak_mean': grp['t_peak_min'].mean().round(2),
+        'mean_flow_m3s':  grp['mean_flow_m3s'].mean().round(6),
+        'mean_vel_ms':   grp['mean_vel_ms'].mean().round(6),
     })
-    final_df  = topo_df.join(node_agg, how='left').reset_index()
-    feat_path = os.path.join(output_dir, 'node_features.csv')
-    final_df.to_csv(feat_path, index=False)
-    print(f"      {feat_path}  ({len(final_df.columns)} columns)")
-
-    # Summary
-    print("\n" + "=" * 60)
-    print("SUMMARY")
-    print("=" * 60)
-    print(f"  Scenarios      : {n_scenarios}")
-    print(f"  Total rows     : {len(raw_df):,}")
-    print(f"  Detection rate : {raw_df['detected'].mean():.1%}")
-    print(f"\n  Top 5 nodes by detection frequency:")
-    top5 = raw_df.groupby('node_id')['detected'].mean().sort_values(ascending=False).head(5)
-    for nid, freq in top5.items():
-        td = topo_depth.get(nid, '?')
-        mf = raw_df[raw_df['node_id']==nid]['mean_flow_m3s'].mean()
-        print(f"    {nid:<10}  freq={freq:.3f}  topo_depth={td}  mean_flow={mf:.5f} m3/s")
-
-    print(f"\n  Sample rows (concept note format, detected=1 only):")
-    cols = ['scen_id','src_node','node_id','dist_src','topo_depth',
-            'peak_conc','t_peak_min','mean_flow_m3s','detected']
-    print(raw_df[raw_df['detected']==1][cols].head(8).to_string(index=False))
-
-    return raw_df, final_df
-
+    final_df = topo_df.join(node_agg, how='left').reset_index()
+    final_df.to_csv(os.path.join(a.output_dir, 'node_features.csv'), index=False)
+    print(f"\nDone. Features saved to {a.output_dir}/node_features.csv")
 
 if __name__ == '__main__':
-    p = argparse.ArgumentParser()
-    p.add_argument('--inp',         default='Example8.inp')
-    p.add_argument('--n_scenarios', type=int, default=100)
-    p.add_argument('--output_dir',  default='./output')
-    p.add_argument('--seed',        type=int, default=42)
-    a = p.parse_args()
-    main(a.inp, a.n_scenarios, a.output_dir, a.seed)
+    main()

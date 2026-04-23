@@ -56,10 +56,36 @@ import json
 import numpy as np
 import pandas as pd
 
+# MLflow for experiment tracking
+try:
+    import mlflow
+    import mlflow.sklearn
+    import mlflow.pytorch
+    import mlflow.xgboost
+    import mlflow.lightgbm
+    MLFLOW_AVAILABLE = True
+except ImportError:
+    MLFLOW_AVAILABLE = False
+    print("Warning: MLflow not available. Install with: pip install mlflow")
+
+# ONNX export
+try:
+    import onnxruntime
+    import onnxmltools
+    from skl2onnx import convert_sklearn
+    from skl2onnx.common.data_types import FloatTensorType
+    ONNX_AVAILABLE = True
+except ImportError:
+    ONNX_AVAILABLE = False
+    print("Warning: ONNX not available. Install with: pip install onnxruntime onnxmltools skl2onnx")
+
+from config import config
+from cache import cached
+
 warnings.filterwarnings("ignore")
 
 # ── Reproducibility ────────────────────────────────────────────────────────────
-SEED = 42
+SEED = config.get('ml.cv.random_state', 42)
 np.random.seed(SEED)
 
 # ── Constants ──────────────────────────────────────────────────────────────────
@@ -73,6 +99,7 @@ STATIC_FEATURES = [
     "node_type_code",
     "is_high_risk",
     "prior_contam_prob",
+    "flow_diversion_fraction",
 ]
 
 DYNAMIC_FEATURES = [
@@ -80,6 +107,10 @@ DYNAMIC_FEATURES = [
     "peak_conc_std",
     "time_to_peak_mean",
     "mean_flow_m3s",
+    "mean_vel_ms",
+    "mean_wastewater_flux",
+    "mean_contaminant_flux",
+    "contaminant_flux_std",
 ]
 
 ALL_NODE_FEATURES = STATIC_FEATURES + DYNAMIC_FEATURES
@@ -101,9 +132,16 @@ def load_node_features(path):
     df = pd.read_csv(path)
     df = df.fillna(0)
 
-    # Exclude outfalls and storage from training — they are not sensor candidates.
-    # Keep them for the prior normalisation step so all 31 nodes get a prior value.
-    df["is_candidate"] = df["node_type"].isin(["J", "JI", "aux"]).astype(int)
+    # Exclude outfalls/storage from training — they are not sensor candidates.
+    # Support both: legacy 'node_type' text column AND new 'node_type_code' int column.
+    # node_type_code: 0 = J (junction), 1 = JI (interceptor), 3 = outfall/storage
+    if "node_type" in df.columns:
+        df["is_candidate"] = df["node_type"].isin(["J", "JI", "aux"]).astype(int)
+    elif "node_type_code" in df.columns:
+        df["is_candidate"] = df["node_type_code"].isin([0, 1]).astype(int)
+    else:
+        # No type info available — treat all nodes as candidates
+        df["is_candidate"] = 1
 
     return df
 
@@ -264,6 +302,7 @@ def train_gradient_boosting(X, y, node_ids, candidate_mask, output_dir):
         return {}
 
     from sklearn.preprocessing import StandardScaler
+    import time
 
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
@@ -273,47 +312,106 @@ def train_gradient_boosting(X, y, node_ids, candidate_mask, output_dir):
     # ── XGBoost ───────────────────────────────────────────────────────────────
     print("  Training XGBoost ...")
 
-    xgb_params = dict(
-        n_estimators=200,
-        max_depth=3,
-        learning_rate=0.05,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        reg_alpha=0.1,
-        reg_lambda=1.0,
-        random_state=SEED,
-        verbosity=0,
-    )
+    xgb_params = config.get('ml.models.xgboost.params', {
+        'n_estimators': 200,
+        'max_depth': 3,
+        'learning_rate': 0.05,
+        'subsample': 0.8,
+        'colsample_bytree': 0.8,
+        'reg_alpha': 0.1,
+        'reg_lambda': 1.0,
+        'random_state': SEED,
+        'verbosity': 0,
+    })
 
     def xgb_fn():
         return xgb.XGBRegressor(**xgb_params)
 
-    xgb_cv = leave_one_out_cv(xgb_fn, X_scaled, y, node_ids)
-    print(f"    LOO MAE={xgb_cv['mae']:.4f}  RMSE={xgb_cv['rmse']:.4f}  "
-          f"R²={xgb_cv['r2']:.4f}  RankCorr={xgb_cv['rank_corr']:.4f}")
+    # MLflow tracking for XGBoost
+    if MLFLOW_AVAILABLE and config.get('ml.tracking.enabled', True):
+        with mlflow.start_run(run_name="XGBoost_Training"):
+            mlflow.log_params(xgb_params)
+            mlflow.log_param("model_type", "XGBoost")
+            mlflow.log_param("cv_type", "Leave-One-Out")
 
-    # Full-data fit for saving and prior extraction
-    xgb_model = xgb.XGBRegressor(**xgb_params)
-    xgb_model.fit(X_scaled, y)
-    model_path = os.path.join(output_dir, "models", "xgb_model.json")
-    xgb_model.save_model(model_path)
-    print(f"    Saved: {model_path}")
+            xgb_cv = leave_one_out_cv(xgb_fn, X_scaled, y, node_ids)
 
-    prior_xgb = normalise_to_prior(xgb_cv["preds"], node_ids, candidate_mask)
-    prior_path = os.path.join(output_dir, "priors", "prior_xgb.csv")
-    prior_xgb.to_csv(prior_path, index=False)
-    print(f"    Prior saved: {prior_path}")
+            # Log metrics
+            mlflow.log_metric("mae", xgb_cv['mae'])
+            mlflow.log_metric("rmse", xgb_cv['rmse'])
+            mlflow.log_metric("r2", xgb_cv['r2'])
+            mlflow.log_metric("rank_corr", xgb_cv['rank_corr'])
 
-    # Feature importance
-    feat_imp_xgb = pd.DataFrame({
-        "feature": ALL_NODE_FEATURES,
-        "importance_xgb": xgb_model.feature_importances_,
-    }).sort_values("importance_xgb", ascending=False)
+            print(f"    LOO MAE={xgb_cv['mae']:.4f}  RMSE={xgb_cv['rmse']:.4f}  "
+                  f"R²={xgb_cv['r2']:.4f}  RankCorr={xgb_cv['rank_corr']:.4f}")
 
-    results["xgb"] = {
-        "model": "XGBoost",
-        **{k: v for k, v in xgb_cv.items() if k != "preds"},
-    }
+            # Full-data fit for saving and prior extraction
+            xgb_model = xgb.XGBRegressor(**xgb_params)
+            xgb_model.fit(X_scaled, y)
+            model_path = os.path.join(output_dir, "models", "xgb_model.json")
+            xgb_model.save_model(model_path)
+            print(f"    Saved: {model_path}")
+
+            # Log model
+            mlflow.xgboost.log_model(xgb_model, "model")
+
+            # ONNX export
+            if ONNX_AVAILABLE:
+                try:
+                    onnx_model = convert_sklearn(xgb_model, initial_types=[('input', FloatTensorType([None, X.shape[1]]))])
+                    onnx_path = os.path.join(output_dir, "models", "xgb_model.onnx")
+                    onnxmltools.utils.save_model(onnx_model, onnx_path)
+                    mlflow.log_artifact(onnx_path, "onnx_model")
+                    print(f"    ONNX exported: {onnx_path}")
+                except Exception as e:
+                    print(f"    ONNX export failed: {e}")
+
+            prior_xgb = normalise_to_prior(xgb_cv["preds"], node_ids, candidate_mask)
+            prior_path = os.path.join(output_dir, "priors", "prior_xgb.csv")
+            prior_xgb.to_csv(prior_path, index=False)
+            print(f"    Prior saved: {prior_path}")
+
+            # Feature importance
+            feat_imp_xgb = pd.DataFrame({
+                "feature": ALL_NODE_FEATURES,
+                "importance_xgb": xgb_model.feature_importances_,
+            }).sort_values("importance_xgb", ascending=False)
+
+            results["xgb"] = {
+                "model": "XGBoost",
+                **{k: v for k, v in xgb_cv.items() if k != "preds"},
+            }
+    else:
+        # Original logic without MLflow
+        start_time = time.time()
+        xgb_cv = leave_one_out_cv(xgb_fn, X_scaled, y, node_ids)
+        print(f"    LOO MAE={xgb_cv['mae']:.4f}  RMSE={xgb_cv['rmse']:.4f}  "
+              f"R²={xgb_cv['r2']:.4f}  RankCorr={xgb_cv['rank_corr']:.4f}")
+
+        # Full-data fit for saving and prior extraction
+        xgb_model = xgb.XGBRegressor(**xgb_params)
+        xgb_model.fit(X_scaled, y)
+        train_time_xgb = time.time() - start_time
+        model_path = os.path.join(output_dir, "models", "xgb_model.json")
+        xgb_model.save_model(model_path)
+        print(f"    Saved: {model_path}")
+
+        prior_xgb = normalise_to_prior(xgb_cv["preds"], node_ids, candidate_mask)
+        prior_path = os.path.join(output_dir, "priors", "prior_xgb.csv")
+        prior_xgb.to_csv(prior_path, index=False)
+        print(f"    Prior saved: {prior_path}")
+
+        # Feature importance
+        feat_imp_xgb = pd.DataFrame({
+            "feature": ALL_NODE_FEATURES,
+            "importance_xgb": xgb_model.feature_importances_,
+        }).sort_values("importance_xgb", ascending=False)
+
+        results["xgb"] = {
+            "model": "XGBoost",
+            "train_time_s": round(train_time_xgb, 2),
+            **{k: v for k, v in xgb_cv.items() if k != "preds"},
+        }
 
     # ── LightGBM ──────────────────────────────────────────────────────────────
     print("  Training LightGBM ...")
@@ -336,12 +434,14 @@ def train_gradient_boosting(X, y, node_ids, candidate_mask, output_dir):
     def lgbm_fn():
         return lgbm.LGBMRegressor(**lgbm_params)
 
+    start_time = time.time()
     lgbm_cv = leave_one_out_cv(lgbm_fn, X_scaled, y, node_ids)
     print(f"    LOO MAE={lgbm_cv['mae']:.4f}  RMSE={lgbm_cv['rmse']:.4f}  "
           f"R²={lgbm_cv['r2']:.4f}  RankCorr={lgbm_cv['rank_corr']:.4f}")
 
     lgbm_model = lgbm.LGBMRegressor(**lgbm_params)
     lgbm_model.fit(X_scaled, y)
+    train_time_lgbm = time.time() - start_time
     model_path = os.path.join(output_dir, "models", "lgbm_model.txt")
     lgbm_model.booster_.save_model(model_path)
     print(f"    Saved: {model_path}")
@@ -364,6 +464,7 @@ def train_gradient_boosting(X, y, node_ids, candidate_mask, output_dir):
 
     results["lgbm"] = {
         "model": "LightGBM",
+        "train_time_s": round(train_time_lgbm, 2),
         **{k: v for k, v in lgbm_cv.items() if k != "preds"},
     }
 
@@ -392,6 +493,7 @@ def train_mlp(X, y, node_ids, candidate_mask, output_dir):
         from sklearn.preprocessing import StandardScaler
         from sklearn.model_selection import KFold
         from sklearn.metrics import mean_absolute_error, r2_score
+        import time
     except (ImportError, OSError):
         print("  [SKIP] PyTorch not installed or not loadable. Run: pip install torch")
         return {}
@@ -438,6 +540,7 @@ def train_mlp(X, y, node_ids, candidate_mask, output_dir):
     kf   = KFold(n_splits=5, shuffle=True, random_state=SEED)
     preds_all = np.zeros(len(y_arr))
 
+    start_time = time.time()
     for fold, (tr_idx, val_idx) in enumerate(kf.split(X_scaled)):
         model = train_one(X_scaled[tr_idx], y_arr[tr_idx])
         model.eval()
@@ -457,6 +560,7 @@ def train_mlp(X, y, node_ids, candidate_mask, output_dir):
 
     # Full-data fit for saving
     full_model = train_one(X_scaled, y_arr, n_epochs=500)
+    train_time_mlp = time.time() - start_time
     model_path = os.path.join(output_dir, "models", "mlp_model.pt")
     torch.save({
         "state_dict": full_model.state_dict(),
@@ -474,6 +578,7 @@ def train_mlp(X, y, node_ids, candidate_mask, output_dir):
     return {
         "mlp": {
             "model": "MLP",
+            "train_time_s": round(train_time_mlp, 2),
             "mae":       round(float(mae),       4),
             "rmse":      round(float(rmse),      4),
             "r2":        round(float(r2),        4),
@@ -513,6 +618,7 @@ def train_gnn(X, y, node_ids, candidate_mask, edge_index, edge_attr, output_dir)
         from torch_geometric.nn import GCNConv, GATConv
         from sklearn.preprocessing import StandardScaler
         from sklearn.metrics import mean_absolute_error, r2_score
+        import time
     except (ImportError, OSError):
         print("  [SKIP] torch-geometric not installed.")
         print("         Run: pip install torch-geometric")
@@ -641,11 +747,13 @@ def train_gnn(X, y, node_ids, candidate_mask, edge_index, edge_attr, output_dir)
 
     for name, ModelClass in [("GCN", GCNModel), ("GAT", GATModel)]:
         print(f"  Training {name} (Monte Carlo CV, 10 repeats) ...")
+        start_time = time.time()
         cv_metrics = mc_cv_gnn(ModelClass)
         print(f"    MC-CV MAE={cv_metrics['mae']:.4f}  RMSE={cv_metrics['rmse']:.4f}  "
               f"R²={cv_metrics['r2']:.4f}  RankCorr={cv_metrics['rank_corr']:.4f}")
 
         full_model = train_gnn_model(ModelClass, n_epochs=500)
+        train_time_gnn = time.time() - start_time
         model_path = os.path.join(output_dir, "models", f"{name.lower()}_model.pt")
         torch.save({
             "state_dict": full_model.state_dict(),
@@ -665,7 +773,7 @@ def train_gnn(X, y, node_ids, candidate_mask, edge_index, edge_attr, output_dir)
         prior_df.to_csv(prior_path, index=False)
         print(f"    Prior saved: {prior_path}")
 
-        results[name.lower()] = {"model": name, **cv_metrics}
+        results[name.lower()] = {"model": name, "train_time_s": round(train_time_gnn, 2), **cv_metrics}
 
     return results
 
@@ -750,7 +858,7 @@ def print_summary(metrics_df):
 # SECTION 7 — MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
-def main(node_features_path, raw_scenarios_path, inp_file, output_dir, skip_gnn):
+def main(node_features_path, raw_scenarios_path, inp_file, output_dir, skip_gnn, exclude_features=None):
 
     # ── Setup output directories ───────────────────────────────────────────────
     for sub in ["models", "priors", "evaluation"]:
@@ -760,6 +868,9 @@ def main(node_features_path, raw_scenarios_path, inp_file, output_dir, skip_gnn)
     print("Hybrid AI Sensor Placement -- ML Training Pipeline")
     print("Mhango & Sambito (2026)")
     print("=" * 60)
+    
+    if exclude_features:
+        print(f"\n[ABLATION STUDY] Excluding features: {exclude_features}")
 
     # ── Load data ──────────────────────────────────────────────────────────────
     print("\n[1/6] Loading data ...")
@@ -772,19 +883,24 @@ def main(node_features_path, raw_scenarios_path, inp_file, output_dir, skip_gnn)
 
     # ── Prepare feature matrix ─────────────────────────────────────────────────
     print("\n[2/6] Preparing feature matrix ...")
-    missing = [c for c in ALL_NODE_FEATURES if c not in node_df.columns]
+    
+    active_features = [f for f in ALL_NODE_FEATURES if f not in (exclude_features or [])]
+    if len(active_features) == 0:
+        raise ValueError("All features were excluded. Cannot train models.")
+        
+    missing = [c for c in active_features if c not in node_df.columns]
     if missing:
         print(f"      WARNING: missing features {missing} — filling with 0")
         for c in missing:
             node_df[c] = 0.0
 
-    X              = node_df[ALL_NODE_FEATURES].values.astype(np.float64)
+    X              = node_df[active_features].values.astype(np.float64)
     y              = node_df[TARGET].values.astype(np.float64)
     node_ids       = node_df["node_id"].values
     candidate_mask = node_df["is_candidate"].values.astype(float)
 
     print(f"      Feature matrix: {X.shape[0]} nodes × {X.shape[1]} features")
-    print(f"      Features: {ALL_NODE_FEATURES}")
+    print(f"      Features used: {active_features}")
 
     # ── Graph structure (for GNN) ──────────────────────────────────────────────
     if not skip_gnn:
@@ -800,14 +916,23 @@ def main(node_features_path, raw_scenarios_path, inp_file, output_dir, skip_gnn)
     all_results = {}
 
     print("\n[4/6] Option A -- Gradient Boosting (XGBoost + LightGBM) ...")
-    all_results.update(train_gradient_boosting(X, y, node_ids, candidate_mask, output_dir))
+    if config.get('ml.models.xgboost.enabled', True) or config.get('ml.models.lightgbm.enabled', True):
+        all_results.update(train_gradient_boosting(X, y, node_ids, candidate_mask, output_dir))
+    else:
+        print("      Option A skipped (disabled in config)")
 
     print("\n[5/6] Option B -- MLP with Dropout ...")
-    all_results.update(train_mlp(X, y, node_ids, candidate_mask, output_dir))
+    if config.get('ml.models.mlp.enabled', True):
+        all_results.update(train_mlp(X, y, node_ids, candidate_mask, output_dir))
+    else:
+        print("      Option B skipped (disabled in config)")
 
     if not skip_gnn and edge_index is not None:
         print("\n[6/6] Option C -- GCN + GAT ...")
-        all_results.update(train_gnn(X, y, node_ids, candidate_mask, edge_index, edge_attr, output_dir))
+        if config.get('ml.models.gnn.enabled', True):
+            all_results.update(train_gnn(X, y, node_ids, candidate_mask, edge_index, edge_attr, output_dir))
+        else:
+            print("      Option C skipped (disabled in config)")
     else:
         print("\n[6/6] Option C -- GNN skipped")
 
@@ -836,18 +961,21 @@ if __name__ == "__main__":
                         help="Path to node_features.csv from dataset_generator.py")
     parser.add_argument("--raw_scenarios",  default="./output/raw_scenarios.csv",
                         help="Path to raw_scenarios.csv from dataset_generator.py")
-    parser.add_argument("--inp",            default="Example8.inp",
+    parser.add_argument("--model_path",     default="./dataset/Examples/Example8.inp",
                         help="Path to SWMM .inp file (for graph edge extraction)")
     parser.add_argument("--output_dir",     default="./ml_output",
                         help="Directory for all model and prior output files")
     parser.add_argument("--skip_gnn",       action="store_true",
                         help="Skip GNN training (use if torch-geometric is not installed)")
+    parser.add_argument("--exclude_features", nargs='+', default=[],
+                        help="List of features to exclude for ablation studies (e.g. mean_vel_ms prior_contam_prob)")
     args = parser.parse_args()
 
     main(
         node_features_path = args.node_features,
         raw_scenarios_path = args.raw_scenarios,
-        inp_file           = args.inp,
+        inp_file           = args.model_path,
         output_dir         = args.output_dir,
         skip_gnn           = args.skip_gnn,
+        exclude_features   = args.exclude_features,
     )

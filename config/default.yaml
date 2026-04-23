@@ -1,0 +1,100 @@
+# Default configuration for SWMM ML pipeline
+environment: development
+
+# Dataset generation settings
+dataset:
+    model_path: "./dataset/Examples/Example9.inp"
+    n_scenarios: 5000
+    output_dir: "./output"
+    seed: 42
+
+    # Scenario parameters
+    threshold: 5.0
+    carrier_flow: 0.01
+    mass_range: [0.01, 0.50]
+    duration_range: [0.25, 3.0]
+    start_range: [0.0, 6.0]
+
+    # Network-specific settings (update for different models)
+    high_risk_nodes: ["J4", "J10", "JI18"]
+    exclude_sources: ["O1", "O2", "Well"]
+
+    # Parallel processing
+    parallel:
+        enabled: true
+        n_workers: null
+        chunk_size: 10
+
+# Feature engineering settings
+features:
+    node_features: "./output/node_features.csv"
+    raw_scenarios: "./output/raw_scenarios.csv"
+    output_dir: "./output"
+
+# ML training settings
+ml:
+    node_features: "./output/node_features_full.csv"
+    raw_scenarios: "./output/raw_scenarios.csv"
+    output_dir: "./ml_output"
+
+    # Model settings
+    models:
+        xgboost:
+            enabled: true
+            params:
+                n_estimators: 100
+                max_depth: 6
+                learning_rate: 0.1
+
+        lightgbm:
+            enabled: true
+            params:
+                n_estimators: 100
+                max_depth: 6
+                learning_rate: 0.1
+
+        mlp:
+            enabled: true
+            hidden_dims: [64, 32]
+            dropout: 0.1
+            learning_rate: 0.001
+            epochs: 100
+
+        gnn:
+            enabled: false
+            hidden_dim: 64
+            num_layers: 2
+            learning_rate: 0.001
+            epochs: 100
+
+    # Cross-validation
+    cv:
+        n_splits: 5
+        shuffle: true
+        random_state: 42
+
+    # Experiment tracking
+    tracking:
+        enabled: true
+        experiment_name: "swmm_sensor_placement"
+        tracking_uri: null
+
+# BDN solver settings
+bdn:
+    raw_scenarios: "./output/raw_scenarios.csv"
+    node_features: "./output/node_features_full.csv"
+    priors_dir: "./ml_output/priors"
+    n_sensors: 3
+    output_dir: "./bdn_output"
+
+# Caching settings
+cache:
+    enabled: true
+    dir: "./cache"
+    backend: "joblib"
+
+# Logging
+logging:
+    level: "INFO"
+    format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    file: "./logs/swmm_pipeline.log"

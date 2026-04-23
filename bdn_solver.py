@@ -81,12 +81,21 @@ def load_data(raw_scenarios_path, node_features_path):
     nf = pd.read_csv(node_features_path).fillna(0)
     node_list = nf["node_id"].tolist()
 
-    candidate_sensors = [
-        n for n in node_list
-        if n not in EXCLUDE_SENSORS
-        and nf.loc[nf["node_id"] == n, "node_type"].values[0]
-           in ("J", "JI", "aux")
-    ]
+    if "node_type" in nf.columns:
+        candidate_sensors = [
+            n for n in node_list
+            if n not in EXCLUDE_SENSORS
+            and nf.loc[nf["node_id"] == n, "node_type"].values[0] in ("J", "JI", "aux")
+        ]
+    else:
+        # Fallback: use node_type_code (0=J, 1=JI, 3=outfall)
+        candidate_sensors = [
+            n for n in node_list
+            if n not in EXCLUDE_SENSORS
+            and nf.loc[nf["node_id"] == n, "node_type_code"].values[0] in (0, 1)
+        ] if "node_type_code" in nf.columns else [
+            n for n in node_list if n not in EXCLUDE_SENSORS
+        ]
 
     candidate_sources = rs["src_node"].unique().tolist()
 
@@ -485,36 +494,42 @@ def main(raw_scenarios_path, node_features_path, priors_dir,
     for prior_name, prior in all_priors.items():
         print(f"\n  Prior: {prior_name}")
 
-        result = greedy_sensor_placement(
-            prior      = prior,
-            p_kj       = p_kj,
-            sensor_order = sensor_order,
-            source_order = source_order,
-            raw_df     = rs,
-            n_sensors  = n_sensors,
-            verbose    = True,
-        )
+        for current_eta in range(1, n_sensors + 1):
+            import time
+            start_time = time.time()
+            result = greedy_sensor_placement(
+                prior      = prior,
+                p_kj       = p_kj,
+                sensor_order = sensor_order,
+                source_order = source_order,
+                raw_df     = rs,
+                n_sensors  = current_eta,
+                verbose    = False,
+            )
+            inference_time = time.time() - start_time
 
-        f1, f2 = compute_f1_f2(
-            result["placed_sensors"],
-            prior, p_kj, sensor_order, source_order
-        )
+            f1, f2 = compute_f1_f2(
+                result["placed_sensors"],
+                prior, p_kj, sensor_order, source_order
+            )
 
-        total_iters = sum(result["convergence_iters"])
+            total_iters = sum(result["convergence_iters"])
 
-        all_results.append({
-            "prior":            prior_name,
-            "sensors_placed":   ", ".join(result["placed_sensors"]),
-            "convergence_iters": ", ".join(str(x) for x in result["convergence_iters"]),
-            "total_updates":    total_iters,
-            "F1":               f1,
-            "F2":               f2,
-        })
+            all_results.append({
+                "prior":            prior_name,
+                "eta":              current_eta,
+                "sensors_placed":   ", ".join(result["placed_sensors"]),
+                "convergence_iters": ", ".join(str(x) for x in result["convergence_iters"]),
+                "total_updates":    total_iters,
+                "F1":               f1,
+                "F2":               f2,
+                "inference_time_s": round(inference_time, 2),
+            })
 
-        print(f"    Sensors: {result['placed_sensors']}")
-        print(f"    F1 (isolation):  {f1:.4f}")
-        print(f"    F2 (detection):  {f2:.4f}")
-        print(f"    Total updates:   {total_iters}")
+        print(f"    Sensors (n={n_sensors}): {result['placed_sensors']}")
+        print(f"    F1 (isolation):     {f1:.4f}")
+        print(f"    F2 (detection):     {f2:.4f}")
+        print(f"    Total updates:      {total_iters}")
 
     # ── Save results ───────────────────────────────────────────────────────────
     print("\n[5/5] Saving results ...")
@@ -529,14 +544,16 @@ def main(raw_scenarios_path, node_features_path, priors_dir,
     print("\n" + "=" * 70)
     print("RESULTS SUMMARY")
     print("=" * 70)
-    print(f"{'Prior':<26} {'Sensors':<26} {'Updates':>7} {'F1':>7} {'F2':>7}")
-    print("-" * 70)
-    for _, row in results_df.sort_values("F1", ascending=False).iterrows():
-        sensors_short = row["sensors_placed"][:25]
-        print(f"{str(row['prior']):<26} {sensors_short:<26} "
+    print(f"{'Prior':<26} {'eta':>3} {'Sensors':<22} {'Updates':>7} {'F1':>7} {'F2':>7}")
+    print("-" * 80)
+    # Only print the max eta for the summary to save space
+    max_eta_df = results_df[results_df["eta"] == n_sensors]
+    for _, row in max_eta_df.sort_values("F1", ascending=False).iterrows():
+        sensors_short = row["sensors_placed"][:22]
+        print(f"{str(row['prior']):<26} {int(row['eta']):>3} {sensors_short:<22} "
               f"{int(row['total_updates']):>7} "
               f"{float(row['F1']):>7.4f} {float(row['F2']):>7.4f}")
-    print("=" * 70)
+    print("=" * 80)
 
     print(f"\nNote: F1 = isolation likelihood | F2 = detection reliability")
     print(f"      Higher is better for both. An ML prior with fewer updates")

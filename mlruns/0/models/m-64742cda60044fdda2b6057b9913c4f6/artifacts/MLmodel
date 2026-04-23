@@ -1,0 +1,22 @@
+artifact_path: file:C:/Users/kamlo/Desktop/Personal/projects/swmm_project/mlruns/0/models/m-64742cda60044fdda2b6057b9913c4f6/artifacts
+flavors:
+  python_function:
+    data: model.ubj
+    env:
+      conda: conda.yaml
+      virtualenv: python_env.yaml
+    loader_module: mlflow.xgboost
+    python_version: 3.13.6
+  xgboost:
+    code: null
+    data: model.ubj
+    model_class: xgboost.sklearn.XGBRegressor
+    model_format: ubj
+    xgb_version: 3.2.0
+mlflow_version: 3.10.1
+model_id: m-64742cda60044fdda2b6057b9913c4f6
+model_size_bytes: 177471
+model_uuid: m-64742cda60044fdda2b6057b9913c4f6
+prompts: null
+run_id: 6b8bc279203a4855a9d614549f4802bd
+utc_time_created: '2026-04-22 10:15:08.146465'
