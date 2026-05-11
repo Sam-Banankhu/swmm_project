@@ -4,7 +4,7 @@ environment: development
 # Dataset generation settings
 dataset:
     model_path: "./dataset/Examples/Example8.inp"
-    n_scenarios: 10
+    n_scenarios: 5000
     output_dir: "./output"
     seed: 42
 
@@ -22,7 +22,7 @@ dataset:
     # Parallel processing
     parallel:
         enabled: true
-        n_workers: 1
+        n_workers: 8
         chunk_size: 10
 
 # Feature engineering settings
