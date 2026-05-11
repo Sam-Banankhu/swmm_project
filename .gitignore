@@ -39,3 +39,5 @@ Record.dat
 .env.*
 *.bak
 *.tmp
+IMPLEMENTATION_DETAILS_1
+.gitignore

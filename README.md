@@ -103,15 +103,26 @@ In the same file, you can also change:
 2. [System Requirements](#2-system-requirements)
 3. [File Inventory](#3-file-inventory)
 4. [Dataset Generator Pipeline](#5-dataset-generator-pipeline)
-5. [Configuration Reference](#7-configuration-reference)
+## 🛠 Project Structure
 
----
+- **`dataset_generator.py`**: Generates contamination scenarios using `PySWMM`.
+- **`feature_engineering.py`**: Extracts topological and hydraulic features (Priors C & D).
+- **`train_models.py`**: Trains ML models to predict node importance.
+- **`bdn_solver.py`**: Executes the Bayesian Decision Network solver and evaluates performance.
+- **`Example8.inp`**: The benchmark combined sewer network.
 
-## 1. Purpose
+## 📊 Key Implementation Details
 
-This project provides the data generation infrastructure for a hybrid AI model that recommends optimal water-quality sensor placements in combined sewer networks. The core idea is to simulate a large number of contamination injection scenarios in SWMM, record which network nodes detect contamination above a threshold, and use those detection patterns — combined with static network topology features — to train an ML model.
+For a detailed walkthrough of the implementation logic, refer to the [Implementation Details](IMPLEMENTATION_DETAILS.md) document.
 
-The scientific basis follows Sambito et al. (2020), who showed that sensor placement in urban drainage can be optimised using detection probability matrices derived from hydraulic simulations.
+### Features
+- **Static Topology**: Betweenness, topo-depth, and downstream path counts.
+- **Dynamic Signals**: Peak concentrations, time-to-peak, and mean flow.
+- **Hybrid Priors**: ML-derived priors replace uniform distributions for faster BDN convergence.
+
+## 📜 References
+- Sambito, M., et al. (2020). "A Bayesian Decision Network for optimal water quality sensor placement..."
+- Mhango, J., & Sambito, M. (2026). "Hybrid AI for Sensor Placement in Urban Drainage Systems."
 
 ---
 

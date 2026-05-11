@@ -107,7 +107,6 @@ DYNAMIC_FEATURES = [
     "peak_conc_std",
     "time_to_peak_mean",
     "mean_flow_m3s",
-    "mean_vel_ms",
     "mean_wastewater_flux",
     "mean_contaminant_flux",
     "contaminant_flux_std",

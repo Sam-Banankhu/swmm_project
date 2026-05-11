@@ -315,7 +315,7 @@ def main(node_features_path, raw_scenarios_path, inp_file, output_path):
         ],
         "Group 4 -- Dynamic Simulation": [
             "peak_conc_mean", "peak_conc_std", "time_to_peak_mean",
-            "mean_flow_m3s", "mean_vel_ms", "detection_freq",
+            "mean_flow_m3s", "detection_freq",
         ],
     }
 
