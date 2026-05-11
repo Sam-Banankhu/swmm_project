@@ -61,7 +61,7 @@ ml:
             epochs: 100
 
         gnn:
-            enabled: false
+            enabled: true
             hidden_dim: 64
             num_layers: 2
             learning_rate: 0.001
