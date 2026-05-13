@@ -3,9 +3,9 @@ environment: development
 
 # Dataset generation settings
 dataset:
-    model_path: "./dataset/Examples/Example8.inp"
+    model_path: "./Examples/Example8.inp"
     n_scenarios: 100
-    output_dir: "./output"
+    output_dir: "./dataset/generated"
     seed: 42
 
     # Scenario parameters
@@ -27,9 +27,9 @@ dataset:
 
 # Feature engineering settings
 features:
-    node_features: "./output/node_features.csv"
-    raw_scenarios: "./output/raw_scenarios.csv"
-    output_dir: "./output"
+    node_features: "./dataset/generated/node_features.csv"
+    raw_scenarios: "./dataset/generated/raw_scenarios.csv"
+    output_dir: "./dataset/generated"
 
 # ML training settings
 ml:
