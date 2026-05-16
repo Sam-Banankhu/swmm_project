@@ -127,7 +127,7 @@ def worker_run_scenario(args):
         else:
             content += f"\n[TIMESERIES]\n{ts_data}\n"
 
-        inflow = f"{src} FLOW {ts_flow} DIRECT 1.0 1.0\n{src} CONTAM {ts_conc} CONCEN 1.0 1.0\n"
+        inflow = f"{src} FLOW {ts_flow} DIRECT 1.0 1.0\n{src} tracer {ts_conc} CONCEN 1.0 1.0\n"
         if '[INFLOWS]' in content:
             content = content.replace('[INFLOWS]', f'[INFLOWS]\n{inflow}')
         else:
@@ -148,7 +148,7 @@ def worker_run_scenario(args):
                 steps += 1
                 for nid in node_ids:
                     node = nodes_obj[nid]
-                    c = node.pollut_quality['CONTAM']
+                    c = node.pollut_quality['tracer']
                     if c > peaks[nid]: peaks[nid] = c; p_step[nid] = steps
                     i_sum[nid] += abs(node.total_inflow)
 

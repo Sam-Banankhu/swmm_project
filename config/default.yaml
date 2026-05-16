@@ -3,9 +3,9 @@ environment: development
 
 # Dataset generation settings
 dataset:
-    model_path: "./dataset/Examples/Example8.inp"
-    n_scenarios: 5000
-    output_dir: "./output"
+    model_path: "./Examples/Example8.inp"
+    n_scenarios: 100
+    output_dir: "./outputs/data"
     seed: 42
 
     # Scenario parameters
@@ -27,15 +27,15 @@ dataset:
 
 # Feature engineering settings
 features:
-    node_features: "./output/node_features.csv"
-    raw_scenarios: "./output/raw_scenarios.csv"
-    output_dir: "./output"
+    node_features: "./outputs/data/node_features.csv"
+    raw_scenarios: "./outputs/data/raw_scenarios.csv"
+    output_dir: "./outputs/data"
 
 # ML training settings
 ml:
-    node_features: "./output/node_features_full.csv"
-    raw_scenarios: "./output/raw_scenarios.csv"
-    output_dir: "./ml_output"
+    node_features: "./outputs/data/node_features.csv"
+    raw_scenarios: "./outputs/data/raw_scenarios.csv"
+    output_dir: "./outputs/models"
 
     # Model settings
     models:
@@ -61,7 +61,7 @@ ml:
             epochs: 100
 
         gnn:
-            enabled: false
+            enabled: true
             hidden_dim: 64
             num_layers: 2
             learning_rate: 0.001
@@ -81,11 +81,11 @@ ml:
 
 # BDN solver settings
 bdn:
-    raw_scenarios: "./output/raw_scenarios.csv"
-    node_features: "./output/node_features_full.csv"
-    priors_dir: "./ml_output/priors"
+    raw_scenarios: "./outputs/data/raw_scenarios.csv"
+    node_features: "./outputs/data/node_features.csv"
+    priors_dir: "./outputs/models/priors"
     n_sensors: 3
-    output_dir: "./bdn_output"
+    output_dir: "./outputs/results"
 
 # Caching settings
 cache:
@@ -97,4 +97,4 @@ cache:
 logging:
     level: "INFO"
     format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-    file: "./logs/swmm_pipeline.log"
+    file: "./outputs/logs/swmm_pipeline.log"

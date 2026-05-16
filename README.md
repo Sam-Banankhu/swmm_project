@@ -189,11 +189,11 @@ Enriches the base node features with regulator/diversion metrics and Monte Carlo
 
 ### `train_models.py`
 
-Trains ML models (XGBoost, LightGBM, MLP, and optionally GCN/GAT) on node-level features and detection targets. Produces ML-derived prior files in `ml_output/priors/`.
+Trains ML models (XGBoost, LightGBM, MLP, and optionally GCN/GAT) on node-level features and detection targets. Produces ML-derived prior files in `outputs/models/priors/`.
 
 ### `bdn_solver.py`
 
-Runs the Bayesian Decision Network comparison over baseline and ML priors using `raw_scenarios.csv` and `node_features_full.csv`. Writes results to `bdn_output/results/comparison_table.csv`.
+Runs the Bayesian Decision Network comparison over baseline and ML priors using `raw_scenarios.csv` and `node_features_full.csv`. Writes results to `outputs/results/comparison_table.csv`.
 
 ### `dump/train_eval_pipeline.py`
 
@@ -292,7 +292,7 @@ ml:
 Models are automatically exported for deployment:
 
 ```bash
-ls ml_output/models/
+ls outputs/models/
 # xgb_model.onnx  lgbm_model.onnx
 ```
 
@@ -316,8 +316,8 @@ A sample of the aggregated node-level feature table from the same 30-scenario ru
 This repo also supports downstream ML and sensor-placement evaluation beyond dataset generation:
 
 - `feature_engineering.py` produces `node_features_full.csv` with additional regulator and Monte Carlo prior features.
-- `train_models.py` trains ML models and writes ML priors to `ml_output/priors/`.
-- `bdn_solver.py` compares classical and ML priors and writes `bdn_output/results/comparison_table.csv`.
+- `train_models.py` trains ML models and writes ML priors to `outputs/models/priors/`.
+- `bdn_solver.py` compares classical and ML priors and writes `outputs/results/comparison_table.csv`.
 - `dump/train_eval_pipeline.py` provides a higher-level workflow for training and evaluation.
 
 ---
@@ -579,7 +579,7 @@ Command-line arguments:
 | --------------- | --------------------------------- | ------------------------------- |
 | `--model_path`  | `./dataset/Examples/Example8.inp` | Path to SWMM input file         |
 | `--n_scenarios` | `100`                             | Number of scenarios to simulate |
-| `--output_dir`  | `./output`                        | Directory for output CSV files  |
+| `--output_dir`  | `./outputs/data`                        | Directory for output CSV files  |
 | `--seed`        | `42`                              | Random seed for reproducibility |
 
 ### `feature_engineering.py` Arguments
@@ -587,18 +587,18 @@ Command-line arguments:
 | Argument          | Default                           | Description                    |
 | ----------------- | --------------------------------- | ------------------------------ |
 | `--model_path`    | `./dataset/Examples/Example8.inp` | Path to SWMM input file        |
-| `--node_features` | `./output/node_features.csv`      | Path to base node features     |
-| `--raw_scenarios` | `./output/raw_scenarios.csv`      | Path to raw scenarios          |
-| `--output_dir`    | `./output`                        | Directory for output CSV files |
+| `--node_features` | `./outputs/data/node_features.csv`      | Path to base node features     |
+| `--raw_scenarios` | `./outputs/data/raw_scenarios.csv`      | Path to raw scenarios          |
+| `--output_dir`    | `./outputs/data`                        | Directory for output CSV files |
 
 ### `train_models.py` Arguments
 
 | Argument          | Default                           | Description                |
 | ----------------- | --------------------------------- | -------------------------- |
 | `--model_path`    | `./dataset/Examples/Example8.inp` | Path to SWMM input file    |
-| `--node_features` | `./output/node_features_full.csv` | Path to full node features |
-| `--raw_scenarios` | `./output/raw_scenarios.csv`      | Path to raw scenarios      |
-| `--output_dir`    | `./ml_output`                     | Directory for ML outputs   |
+| `--node_features` | `./outputs/data/node_features_full.csv` | Path to full node features |
+| `--raw_scenarios` | `./outputs/data/raw_scenarios.csv`      | Path to raw scenarios      |
+| `--output_dir`    | `./outputs/models`                     | Directory for ML outputs   |
 | `--skip_gnn`      | `False`                           | Skip GNN training if True  |
 
 ---
@@ -642,7 +642,7 @@ if '[POLLUTANTS]' not in content:
 For a full ML training dataset, run with `--n_scenarios 5000` or more. Each scenario takes approximately 1–2 seconds, so 5,000 scenarios require roughly 2–3 hours.
 
 ```bash
-python dataset_generator.py --n_scenarios 5000 --output_dir ./output
+python dataset_generator.py --n_scenarios 5000 --output_dir ./outputs/data
 ```
 
 ### Adding decay
