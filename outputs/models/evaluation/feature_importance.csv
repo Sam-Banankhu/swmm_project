@@ -1,0 +1,16 @@
+feature,importance_xgb,importance_lgbm
+time_to_peak_mean,0.34372476,154
+contaminant_flux_std,0.24004558,12
+n_upstream_nodes,0.14213838,196
+mean_flow_m3s,0.1364056,87
+mean_wastewater_flux,0.08518381,19
+peak_conc_std,0.01721712,17
+peak_conc_mean,0.015094016,29
+topo_depth,0.009239793,34
+betweenness,0.008852476,114
+node_type_code,0.0015929823,39
+mean_contaminant_flux,0.00048186112,3
+downstream_paths,1.5420119e-05,0
+is_high_risk,8.2586375e-06,0
+prior_contam_prob,0.0,0
+flow_diversion_fraction,0.0,0

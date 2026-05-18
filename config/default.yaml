@@ -4,7 +4,7 @@ environment: development
 # Dataset generation settings
 dataset:
     model_path: "./Examples/Example8.inp"
-    n_scenarios: 100
+    n_scenarios: 1000
     output_dir: "./outputs/data"
     seed: 42
 
@@ -16,8 +16,8 @@ dataset:
     start_range: [0.0, 6.0]
 
     # Network-specific settings (update for different models)
-    high_risk_nodes: ["J4", "J10", "JI18"]
-    exclude_sources: ["O1", "O2", "Well"]
+    high_risk_nodes: ["J4", "J10"]
+    exclude_sources: ["O1", "O2", "Well", "entry"]
 
     # Parallel processing
     parallel:

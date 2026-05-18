@@ -61,12 +61,12 @@ MAX_ITER = 200    # maximum Bayesian update iterations per sensor
 rng = np.random.RandomState(SEED)
 
 # Nodes excluded from sensor placement (not physical candidates)
-EXCLUDE_SENSORS = {"O1", "O2", "Well"}
+EXCLUDE_SENSORS = {"O1", "O2", "Well", "entry"}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SECTION 1 — DATA LOADING
-# ══════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 
 def load_data(raw_scenarios_path, node_features_path):
     """
