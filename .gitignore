@@ -41,3 +41,5 @@ Record.dat
 *.tmp
 IMPLEMENTATION_DETAILS_1
 .gitignore
+outputs/
+outputs/*
